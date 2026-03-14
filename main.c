@@ -49,6 +49,7 @@ bool isDual = false;
 bool is_sound_enabled = false;
 bool is_button_pressed = false;
 bool sout = true;
+bool evt_mode = false;
 
 bool pd = false;
 
@@ -130,6 +131,10 @@ void gpio_callback(uint gpio, uint32_t events) {
 		} else
 		if (gpio == 2) {
 			ch2_cnt++;
+		}
+
+		if (evt_mode) {
+			printf("E %llu %u\n", time_us_64(), gpio == 22 ? 1 : 2);
 		}
 	}
 }
@@ -749,9 +754,15 @@ void SerCmdExec(void) {
 
 	if (memcmp((char*)CmdBuf, "stop", 4) == 0) {
 		sout = false;
+		evt_mode = false;
 	} else
 	if (memcmp((char*)CmdBuf, "go", 2) == 0) {
 		sout = true;
+		evt_mode = false;
+	} else
+	if (memcmp((char*)CmdBuf, "evt", 3) == 0) {
+		sout = false;
+		evt_mode = true;
 	} else
 	if (memcmp((char*)CmdBuf, "set ", 4) == 0) {
 		ptr = (char*)CmdBuf + 4;
