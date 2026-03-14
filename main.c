@@ -26,7 +26,7 @@
 #include "eeprom.h"
 #include "image.h"
 
-#define FW_VERSION "FWNX1R04"
+#define FW_VERSION "FWNX1E01"
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
