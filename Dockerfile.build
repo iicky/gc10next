@@ -1,0 +1,20 @@
+FROM debian:bookworm-slim AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
+    libstdc++-arm-none-eabi-newlib \
+    build-essential git python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/raspberrypi/pico-sdk.git /pico-sdk \
+    && cd /pico-sdk && git checkout 1.5.1 && git submodule update --init --depth 1 lib/tinyusb
+
+ENV PICO_SDK_PATH=/pico-sdk
+
+WORKDIR /src
+COPY main.c ssd1306.c ssd1306.h eeprom.h font.h image.h CMakeLists.txt pico_sdk_import.cmake ./
+
+RUN mkdir build && cd build && cmake .. && make -j$(nproc)
+
+FROM scratch
+COPY --from=build /src/build/main.uf2 /gc10next.uf2
