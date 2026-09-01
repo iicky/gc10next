@@ -1118,12 +1118,20 @@ int main() {
 	// LOAD EEPROM
 	// Stage through plain locals: these globals are volatile because IRQs read
 	// them, and eeprom_read_* takes a non-volatile pointer.
-	uint16_t gms_init;
-	uint8_t  dispmode_init;
+	//
+	// Seed each local from its global. eeprom_read_* returns without writing
+	// through the pointer when the I2C transfer fails, so an uninitialised
+	// local would leave stack garbage in the global. dispMode in particular
+	// must stay within MODEMAX: dispCPM tests it against each mode in turn and
+	// draws nothing at all if none match, freezing the display.
+	uint16_t gms_init = gamma_sensitivity;
+	uint16_t alarm_init = alarm_trigger_cpm;
+	uint8_t  dispmode_init = dispMode;
 	eeprom_read_word(OFS_GMS, &gms_init);
-	eeprom_read_word(OFS_ALARM, &alarm_trigger_cpm);
+	eeprom_read_word(OFS_ALARM, &alarm_init);
 	eeprom_read_byte(OFS_DISPMODE, &dispmode_init);
 	gamma_sensitivity = gms_init;
+	alarm_trigger_cpm = alarm_init;
 	dispMode = dispmode_init;
 
 	cmax = 0;
