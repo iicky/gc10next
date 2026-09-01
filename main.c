@@ -30,7 +30,7 @@
 #include "image.h"
 #include "pulse_ts.pio.h"
 
-#define FW_VERSION "FWNX1E01"
+#define FW_VERSION "FWNX1H01"
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
@@ -136,6 +136,19 @@ static bool      ts_running = false;
 // a single byte, written with one strb, so the IRQ cannot tear it.
 typedef enum { OUT_CPM = 0, OUT_QUIET, OUT_EVT } out_mode_t;
 static volatile out_mode_t out_req = OUT_CPM;
+
+// Work requested by interrupts and performed in the main loop.
+//
+// Nothing that can block belongs in an IRQ on this board. The OLED refresh is
+// a 1025-byte I2C blit that takes ~23 ms, and any printf can stall for up to
+// 500 ms waiting on USB plus 1000 ms on the stdio mutex. Running either from
+// the 1 Hz timer callback stalled every other interrupt behind it, which is
+// what made the detection interrupt miss counts in the first place. The timer
+// now only computes and raises a flag; the main loop does the slow part with
+// interrupts enabled, so the detector is never held off.
+static volatile bool     ui_refresh_req = false;   // redraw the measurement screen
+static volatile bool     cpm_out_pending = false;  // a CPM value is due on the wire
+static volatile uint32_t cpm_out_value = 0;
 
 // Total words the DMA has written since it was armed. transfer_count reads
 // back as the remaining count, and we arm with 0xFFFFFFFF.
@@ -311,12 +324,6 @@ void gpio_callback(uint gpio, uint32_t events) {
 	}
 }
 
-void on_uart_rx() {
-	while (uart_is_readable(uart1)) {
-		SerCmdProc(uart_getc(uart1));
-	}
-}
-
 void SerCmdProc(char ch)
 {
 	switch(ch) {
@@ -359,17 +366,9 @@ bool msecTimer_callback(repeating_timer_t *rt) {
 		}
 	}
 
-	// Test-and-clear without masking. This is only safe because pd is set in
-	// thread context and cleared here in an IRQ on a single core, so the
-	// setter cannot run between the test and the clear. Two requests arriving
-	// before either is serviced coalesce into one redraw, which is correct:
-	// prepareDisp reads dispMode fresh. Add masking (as secTimer_callback does
-	// for cpx) if pd ever gains an IRQ-context writer or this goes multicore.
-	if (pd == true) {
-		prepareDisp();
-		pd = false;
-	}
-
+	// prepareDisp blits the framebuffer over I2C, so it cannot run here. Leave
+	// pd set and let the main loop service it; the redraw is idempotent and
+	// coalescing repeats is correct, since prepareDisp reads dispMode fresh.
 	return true;
 }
 
@@ -415,7 +414,9 @@ bool secTimer_callback(repeating_timer_t *rt) {
 		sec_tmr = 0;
 	}
 
-	dispCPM();
+	// The screen refresh and the serial write both block for tens of ms. Only
+	// raise the request here; the main loop performs them.
+	ui_refresh_req = true;
 
 	return true;
 }
@@ -743,10 +744,12 @@ void dispCPM(void) {
 		ssd1306_show(&disp);
 	}
 
-	// CPM output
-	if (sout) {
-		printf("%d\n", tmp);
-	}
+	// The CPM value is handed to the main loop rather than written here.
+	// dispCPM is called from thread context now, but keeping the wire write
+	// out of this function means the display path and the serial path cannot
+	// stall each other.
+	cpm_out_value = tmp;
+	cpm_out_pending = true;
 }
 
 void software_reset() {
@@ -1223,11 +1226,10 @@ int main() {
 	gpio_pull_up(21);
 	bi_decl(bi_2pins_with_func(20, 21, GPIO_FUNC_I2C));
 
-	// UART
+	// UART. Deliberately no RX interrupt: the main loop polls uart_is_readable
+	// so command parsing (and the printf echo it performs) stays in thread
+	// context, and so both transports cannot write CmdBuf concurrently.
 	//uart_set_baudrate(uart1, 9600);
-	irq_set_exclusive_handler(UART1_IRQ, on_uart_rx);
-	irq_set_enabled(UART1_IRQ, true);
-	uart_set_irq_enables(uart1, true, false);
 
 	// OLED
 	i2c_init(i2c1, 400000);
@@ -1285,15 +1287,18 @@ int main() {
 	gpio_set_dir(2, GPIO_IN);
 	gpio_pull_up(2);
 
-	gpio_set_irq_enabled(2, GPIO_IRQ_EDGE_FALL, true);
+	// Only the Dual has a tube on CH2. On a single-tube board GP2 is an
+	// unconnected header pin held by a weak internal pull-up, so enabling its
+	// edge interrupt just invites noise into the count.
+	if (isDual) {
+		gpio_set_irq_enabled(2, GPIO_IRQ_EDGE_FALL, true);
+	}
 
-	// The 1 Hz timer callback blits the whole OLED framebuffer over I2C, which
-	// blocks for ~23 ms. Alarm and GPIO IRQs default to the same priority, so
-	// the detection IRQ could not preempt it and every edge arriving during the
-	// blit collapsed into a single count (the GPIO edge latch is one sticky bit
-	// per pin, not a counter). That cost ~1-2% of all counts, once per second.
-	irq_set_priority(IO_IRQ_BANK0, PICO_HIGHEST_IRQ_PRIORITY);
-
+	// No interrupt priority juggling. The 1 Hz callback used to blit the whole
+	// OLED framebuffer over I2C from inside the timer interrupt, blocking the
+	// detection interrupt for ~23 ms and losing every edge but one in that
+	// window. That work now runs in the main loop, so the alarm interrupt is
+	// short and the detector needs no special priority to be serviced.
 	add_repeating_timer_ms(-1, &msecTimer_callback, NULL, &msecTimer);
 	add_repeating_timer_ms(-1000, &secTimer_callback, NULL, &secTimer);
 
@@ -1314,13 +1319,19 @@ int main() {
 	eeprom_read_byte(OFS_DISPMODE, &dispmode_init);
 	gamma_sensitivity = gms_init;
 	alarm_trigger_cpm = alarm_init;
-	dispMode = dispmode_init;
+	dispMode = (dispmode_init > MODEMAX) ? 0 : dispmode_init;
 
 	cmax = 0;
 	cptr = 0;
 	uptime = 0;
 
 	int c;
+
+	// Last resort. If the main loop ever stops feeding this, the board reboots
+	// itself instead of sitting wedged until someone can reach the BOOTSEL
+	// button. The loop period is 25 ms plus a display blit, so 3 s is far more
+	// headroom than any legitimate iteration needs.
+	watchdog_enable(3000, 1);
 
 	while(1) {
 
@@ -1370,16 +1381,39 @@ int main() {
 
 		sout     = (want == OUT_CPM);
 		evt_mode = (want == OUT_EVT);
+		// Deferred display work. Both calls blit the framebuffer over I2C and
+		// block for ~23 ms, so they run here with interrupts enabled rather
+		// than inside the timer callback that used to invoke them.
+		if (pd) {
+			pd = false;
+			prepareDisp();
+		}
+		if (ui_refresh_req) {
+			ui_refresh_req = false;
+			dispCPM();
+		}
+		if (cpm_out_pending) {
+			cpm_out_pending = false;
+			if (sout) printf("%lu\n", (unsigned long)cpm_out_value);
+		}
 
 		if (evt_mode) {
 			ts_drain();
 		}
 
+		// Commands from both transports are parsed here, in thread context.
+		// Previously UART bytes were parsed inside UART1_IRQ, which put printf
+		// in an interrupt and let two transports write CmdBuf concurrently.
+		while (uart_is_readable(uart1)) {
+			SerCmdProc(uart_getc(uart1));
+		}
 		if (tud_cdc_connected()) {
 			while ((c = tud_cdc_read_char()) != -1) {
 				SerCmdProc(c);
 			}
 		}
+
+		watchdog_update();
 	}
 
 	return 0;
