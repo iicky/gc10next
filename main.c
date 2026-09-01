@@ -193,6 +193,8 @@ bool msecTimer_callback(repeating_timer_t *rt) {
 		prepareDisp();
 		pd = false;
 	}
+
+	return true;
 }
 
 bool secTimer_callback(repeating_timer_t *rt) {
@@ -238,6 +240,8 @@ bool secTimer_callback(repeating_timer_t *rt) {
 	}
 
 	dispCPM();
+
+	return true;
 }
 
 long map(long x, long in_min, long in_max, long out_min, long out_max) {
@@ -245,7 +249,7 @@ long map(long x, long in_min, long in_max, long out_min, long out_max) {
 }
 
 void prepareDisp(void) {
-	char buf[12];
+	char buf[24];
 
 	if (dispMode == 0) {
 		ssd1306_clear(&disp);
@@ -358,7 +362,7 @@ void prepareDisp(void) {
 void dispCPM(void) {
 	uint8_t i, j;
 	uint32_t tmp;
-	char buf[12];
+	char buf[24];
 
 	sma[sma_idx++] = cpm;
 	if (sma_idx == 4) sma_idx = 0;
@@ -758,7 +762,7 @@ int eeprom_read_page(int addr, uint8_t *p, size_t len)
 
 void SerCmdExec(void) {
 	char* ptr;
-	char buf[8];
+	char buf[24];
 
 	if (memcmp((char*)CmdBuf, "stop", 4) == 0) {
 		sout = false;
@@ -818,25 +822,10 @@ void SerCmdExec(void) {
 		eeprom_write_byte(OFS_SOUND, (is_sound_enabled == true)? 1 : 0);
 	} else
 	if (memcmp((char*)CmdBuf, "show", 4) == 0) {
-		printf("ttc: ");
-		sprintf(buf, "%lu", total_cnt);
-		printf(buf);
-		printf("\r\n");
-
-		printf("gms: ");
-		sprintf(buf, "%u", gamma_sensitivity);
-		printf(buf);
-		printf("\r\n");
-
-		printf("atc: ");
-		sprintf(buf, "%u", alarm_trigger_cpm);
-		printf(buf);
-		printf("\r\n");
-
-		printf("hvg: ");
-		sprintf(buf, "%u", hvg_pulsewidth);
-		printf(buf);
-		printf("\r\n");
+		printf("ttc: %lu\r\n", (unsigned long)total_cnt);
+		printf("gms: %u\r\n", gamma_sensitivity);
+		printf("atc: %u\r\n", alarm_trigger_cpm);
+		printf("hvg: %u\r\n", hvg_pulsewidth);
 	} else
 	if (memcmp((char*)CmdBuf, "reboot", 6) == 0) {
 		software_reset();
@@ -862,9 +851,7 @@ void SerCmdExec(void) {
 		printf("%s\n", pmn);
 		printf("%02X%02X\n", rev[1],rev[0]);
 
-		sprintf(buf, "%s", FW_VERSION);
-		printf(buf);
-		printf("\r\n");
+		printf("%s\r\n", FW_VERSION);
 	}
 }
 
@@ -1105,13 +1092,6 @@ int main() {
 	pwm_set_chan_level(bzsPwmSlice, PWM_CHAN_A, 0);
 	pwm_set_enabled(bzsPwmSlice, true);
 
-	// The 1 Hz timer callback blits the whole OLED framebuffer over I2C, which
-	// blocks for ~23 ms. Alarm and GPIO IRQs default to the same priority, so
-	// the detection IRQ could not preempt it and every edge arriving during the
-	// blit collapsed into a single count (the GPIO edge latch is one sticky bit
-	// per pin, not a counter). That cost ~1-2% of all counts, once per second.
-	irq_set_priority(IO_IRQ_BANK0, PICO_HIGHEST_IRQ_PRIORITY);
-
 	// DETECTION
 	gpio_init(22);			// DETECTION PULSE INT CH1
 	gpio_set_dir(22, GPIO_IN);
@@ -1124,6 +1104,13 @@ int main() {
 	gpio_pull_up(2);
 
 	gpio_set_irq_enabled(2, GPIO_IRQ_EDGE_FALL, true);
+
+	// The 1 Hz timer callback blits the whole OLED framebuffer over I2C, which
+	// blocks for ~23 ms. Alarm and GPIO IRQs default to the same priority, so
+	// the detection IRQ could not preempt it and every edge arriving during the
+	// blit collapsed into a single count (the GPIO edge latch is one sticky bit
+	// per pin, not a counter). That cost ~1-2% of all counts, once per second.
+	irq_set_priority(IO_IRQ_BANK0, PICO_HIGHEST_IRQ_PRIORITY);
 
 	add_repeating_timer_ms(-1, &msecTimer_callback, NULL, &msecTimer);
 	add_repeating_timer_ms(-1000, &secTimer_callback, NULL, &secTimer);
