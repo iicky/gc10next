@@ -13,7 +13,10 @@ add_executable(main
 pico_enable_stdio_usb(main 1)
 pico_enable_stdio_uart(main 1)
 
-add_compile_definitions(PICO_DEFAULT_UART_INSTANCE=uart1)
+# SDK 2.x made PICO_DEFAULT_UART_INSTANCE a function-like macro, so defining it
+# to `uart1` broke every translation unit. Select the instance by index instead:
+# this spelling works on both SDK 1.5.x and 2.x.
+add_compile_definitions(PICO_DEFAULT_UART=1)
 add_compile_definitions(PICO_DEFAULT_UART_TX_PIN=4)
 add_compile_definitions(PICO_DEFAULT_UART_RX_PIN=5)
 
