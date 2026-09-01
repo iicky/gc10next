@@ -33,30 +33,31 @@
 const uint LED_PIN = 25;
 const float conversion_factor = 3.3f / ( 1 << 12) * 3;
 
-static int tc = 0;
-uint32_t total_cnt;
-uint32_t ch1_cnt;
-uint32_t ch2_cnt;
+// Written by the detection IRQ, read elsewhere: must not be cached in registers.
+static volatile int tc = 0;
+volatile uint32_t total_cnt;
+volatile uint32_t ch1_cnt;
+volatile uint32_t ch2_cnt;
 
 static uint hvgPwmSlice;
 static uint bzsPwmSlice;
 
 uint16_t result;
 
-static bool df = false; // Detection Flag
+static volatile bool df = false; // Detection Flag
 
 bool isDual = false;
-bool is_sound_enabled = false;
+volatile bool is_sound_enabled = false;	// main loop/SerCmdExec write, detection IRQ reads
 bool is_button_pressed = false;
-bool sout = true;
+volatile bool sout = true;		// SerCmdExec writes, timer IRQ reads in dispCPM
 bool evt_mode = false;
 
-bool pd = false;
+volatile bool pd = false;		// main loop writes, timer IRQ reads and clears
 
 uint8_t cptr;
-uint8_t dispMode;
+volatile uint8_t dispMode;		// main loop writes, timer IRQ reads
 
-uint16_t gamma_sensitivity;
+volatile uint16_t gamma_sensitivity;	// SerCmdExec writes, timer IRQ reads
 uint16_t alarm_trigger_cpm;
 uint16_t hvg_pulsewidth;
 char CmdBuf[16];
@@ -65,7 +66,7 @@ uint32_t uptime;
 uint32_t cpm;
 uint32_t sma[4];
 uint16_t cbuf[20];
-uint16_t cpx;
+volatile uint16_t cpx;
 uint16_t lp;	// Long button press detection counter
 
 uint16_t cnt = 0;
@@ -187,6 +188,12 @@ bool msecTimer_callback(repeating_timer_t *rt) {
 		}
 	}
 
+	// Test-and-clear without masking. This is only safe because pd is set in
+	// thread context and cleared here in an IRQ on a single core, so the
+	// setter cannot run between the test and the clear. Two requests arriving
+	// before either is serviced coalesce into one redraw, which is correct:
+	// prepareDisp reads dispMode fresh. Add masking (as secTimer_callback does
+	// for cpx) if pd ever gains an IRQ-context writer or this goes multicore.
 	if (pd == true) {
 		prepareDisp();
 		pd = false;
@@ -200,10 +207,16 @@ bool secTimer_callback(repeating_timer_t *rt) {
 	uptime++;	
 
 	if (sec_tmr % 3 == 0) {
-		cbuf[cbuf_idx++] = cpx;
+		// Read-and-clear must be atomic: the detection IRQ runs at a higher
+		// priority than this timer callback and increments cpx.
+		uint32_t irq_state = save_and_disable_interrupts();
+		uint16_t counts = cpx;
+		cpx = 0;
+		restore_interrupts(irq_state);
+
+		cbuf[cbuf_idx++] = counts;
 		if (cbuf_idx == 20) cbuf_idx = 0;
 
-		cpx = 0;
 		cpm = 0;
 		for (i = 0; i < 20; i++) cpm += cbuf[i];
 	}
@@ -1103,6 +1116,13 @@ int main() {
 	pwm_set_chan_level(bzsPwmSlice, PWM_CHAN_A, 0);
 	pwm_set_enabled(bzsPwmSlice, true);
 
+	// The 1 Hz timer callback blits the whole OLED framebuffer over I2C, which
+	// blocks for ~23 ms. Alarm and GPIO IRQs default to the same priority, so
+	// the detection IRQ could not preempt it and every edge arriving during the
+	// blit collapsed into a single count (the GPIO edge latch is one sticky bit
+	// per pin, not a counter). That cost ~1-2% of all counts, once per second.
+	irq_set_priority(IO_IRQ_BANK0, PICO_HIGHEST_IRQ_PRIORITY);
+
 	// DETECTION
 	gpio_init(22);			// DETECTION PULSE INT CH1
 	gpio_set_dir(22, GPIO_IN);
@@ -1120,9 +1140,15 @@ int main() {
 	add_repeating_timer_ms(-1000, &secTimer_callback, NULL, &secTimer);
 
 	// LOAD EEPROM
-	eeprom_read_word(OFS_GMS, &gamma_sensitivity);
+	// Stage through plain locals: these globals are volatile because IRQs read
+	// them, and eeprom_read_* takes a non-volatile pointer.
+	uint16_t gms_init;
+	uint8_t  dispmode_init;
+	eeprom_read_word(OFS_GMS, &gms_init);
 	eeprom_read_word(OFS_ALARM, &alarm_trigger_cpm);
-	eeprom_read_byte(OFS_DISPMODE, &dispMode);
+	eeprom_read_byte(OFS_DISPMODE, &dispmode_init);
+	gamma_sensitivity = gms_init;
+	dispMode = dispmode_init;
 
 	cmax = 0;
 	cptr = 0;
