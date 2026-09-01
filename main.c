@@ -21,10 +21,14 @@
 #include "hardware/watchdog.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/clocks.h"
 #include "class/cdc/cdc_device.h"
 #include "ssd1306.h"
 #include "eeprom.h"
 #include "image.h"
+#include "pulse_ts.pio.h"
 
 #define FW_VERSION "FWNX1E01"
 #define MODEMAX 2
@@ -49,8 +53,8 @@ static volatile bool df = false; // Detection Flag
 bool isDual = false;
 volatile bool is_sound_enabled = false;	// main loop/SerCmdExec write, detection IRQ reads
 bool is_button_pressed = false;
-volatile bool sout = true;		// SerCmdExec writes, timer IRQ reads in dispCPM
-bool evt_mode = false;
+volatile bool sout = true;      // written by main loop, read by dispCPM in timer IRQ
+bool evt_mode = false;          // main loop only
 
 volatile bool pd = false;		// main loop writes, timer IRQ reads and clears
 
@@ -95,6 +99,172 @@ void SerCmdExec(void);
 void dispCPM(void);
 void prepareDisp(void);
 
+// ---------------------------------------------------------------------------
+// Hardware pulse timestamping (PIO + DMA)
+//
+// Two state machines run pulse_ts.pio, one per detection input, started in
+// sync so they share a single epoch. Each falling edge pushes a 32-bit
+// timebase snapshot; a DMA channel per SM moves those words into a ring
+// buffer. Nothing here needs the ARM core, so capture survives the 23 ms
+// OLED refresh, USB traffic, and any other interrupt work.
+// ---------------------------------------------------------------------------
+
+#define TS_CH_COUNT   2
+#define TS_RING_LOG2  10                       // 1024 entries per channel
+#define TS_RING_LEN   (1u << TS_RING_LOG2)
+#define TS_RING_BYTES (TS_RING_LEN * 4u)
+
+// The DMA write-address wrap requires the buffer to be aligned to its size.
+static uint32_t ts_ring[TS_CH_COUNT][TS_RING_LEN] __attribute__((aligned(TS_RING_BYTES)));
+
+static const uint ts_gpio[TS_CH_COUNT] = { 22, 2 };   // CH1 = GP22, CH2 = GP2
+static PIO       ts_pio = pio0;
+static int       ts_dma[TS_CH_COUNT]      = { -1, -1 };
+static uint64_t  ts_consumed[TS_CH_COUNT] = { 0, 0 };
+static uint32_t  ts_lost[TS_CH_COUNT]     = { 0, 0 };
+static uint32_t  ts_prev_x[TS_CH_COUNT]   = { 0, 0 };
+static uint64_t  ts_ticks[TS_CH_COUNT]    = { 0, 0 };
+static bool      ts_primed[TS_CH_COUNT]   = { false, false };
+static uint32_t  ts_per_us = 6;   // SM ticks per microsecond, set in ts_start
+static uint      ts_nch = 1;      // always 1: see the note in ts_start
+static bool      ts_running = false;
+// Output mode is one small scalar owned by SerCmdExec, which may run in
+// UART1_IRQ. The main loop reconciles sout/evt_mode from it. Independent
+// start/stop flags would race: a `stop` landing between the main loop's read
+// and its action would be lost, and a `go` would leave CPM lines interleaved
+// into a capture. Under the ARM EABI default (-fshort-enums) this compiles to
+// a single byte, written with one strb, so the IRQ cannot tear it.
+typedef enum { OUT_CPM = 0, OUT_QUIET, OUT_EVT } out_mode_t;
+static volatile out_mode_t out_req = OUT_CPM;
+
+// Total words the DMA has written since it was armed. transfer_count reads
+// back as the remaining count, and we arm with 0xFFFFFFFF.
+static uint32_t ts_produced(uint idx) {
+	return 0xFFFFFFFFu - dma_hw->ch[ts_dma[idx]].transfer_count;
+}
+
+static void ts_start(void) {
+	if (ts_running) {
+		// Re-entering evt: drop the backlog so capture starts at "now", and
+		// re-prime so the first event after the gap is consumed silently as a
+		// new anchor. ts_ticks does not advance while stopped, so the clock
+		// never jumps and the consumer's next delta is a real interarrival.
+		for (uint i = 0; i < ts_nch; i++) {
+			ts_consumed[i] = ts_produced(i);
+			ts_primed[i] = false;
+		}
+		return;
+	}
+
+	// evt captures CH1 only, including on the Dual. Two independent blockers,
+	// both of which must be solved together before ts_nch can become 2:
+	//
+	//  1. Ordering. ts_drain walks one ring to completion before starting the
+	//     next, so a second channel would emit all of CH1's batch and then all
+	//     of CH2's. Consumers take deltas across global line order, so
+	//     interleaved channels yield out-of-order and negative intervals. The
+	//     two rings must be merged by tick before output, using a cross-ring
+	//     watermark, since a sample may not have landed in one ring when the
+	//     other is snapshotted.
+	//  2. Epoch. Each channel anchors its own tick total on its own first
+	//     event, so even perfectly ordered output would mix two clocks.
+	//
+	// Either alone is insufficient. Shipping them half-done would feed
+	// meaningless intervals to /dev/random as if they were decay timings.
+	// The GPIO interrupt still counts CH2 for the display; only evt is CH1.
+	ts_nch = 1;
+	ts_per_us = clock_get_hz(clk_sys) / (1000000u * 8u);
+
+	uint offset = pio_add_program(ts_pio, &pulse_ts_program);
+	uint sm_mask = 0;
+
+	for (uint i = 0; i < ts_nch; i++) {
+		// Input only: do not claim the pad with pio_gpio_init, so the existing
+		// GPIO interrupt, pull-up, LED and buzzer behaviour keep working.
+		pio_sm_config c = pulse_ts_program_get_default_config(offset);
+		sm_config_set_jmp_pin(&c, ts_gpio[i]);
+		sm_config_set_clkdiv_int_frac(&c, 1, 0);
+
+		// Enter at 'recov' so a line already low at boot cannot fake an edge.
+		pio_sm_init(ts_pio, i, offset + pulse_ts_offset_recov, &c);
+		pio_sm_exec(ts_pio, i, pio_encode_mov_not(pio_x, pio_null));
+		sm_mask |= 1u << i;
+
+		int ch = dma_claim_unused_channel(true);
+		ts_dma[i] = ch;
+		dma_channel_config dc = dma_channel_get_default_config(ch);
+		channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+		channel_config_set_read_increment(&dc, false);
+		channel_config_set_write_increment(&dc, true);
+		channel_config_set_ring(&dc, true, TS_RING_LOG2 + 2);
+		channel_config_set_dreq(&dc, pio_get_dreq(ts_pio, i, false));
+		dma_channel_configure(ch, &dc, ts_ring[i], &ts_pio->rxf[i], 0xFFFFFFFFu, true);
+
+		ts_consumed[i] = 0;
+		ts_lost[i] = 0;
+	}
+
+	// Simultaneous start: both counters share an epoch from here on.
+	pio_enable_sm_mask_in_sync(ts_pio, sm_mask);
+	ts_running = true;
+}
+
+// Drain both rings to stdout. Runs in thread context, never in an interrupt.
+static void ts_drain(void) {
+	for (uint i = 0; i < ts_nch; i++) {
+		if (ts_dma[i] < 0) continue;
+
+		uint64_t produced = ts_produced(i);
+		uint64_t avail = produced - ts_consumed[i];
+
+		if (avail > TS_RING_LEN) {
+			// DMA lapped the ring. Resuming here would hand the consumer one
+			// fabricated interarrival spanning every lost event, because it
+			// derives intervals from consecutive lines and cannot see a
+			// comment marker. That is the same corruption this capture path
+			// exists to remove, so fail closed instead of emitting it.
+			// `evt` restarts the stream with a re-primed epoch.
+			uint32_t lost = (uint32_t)(avail - TS_RING_LEN);
+			ts_lost[i] += lost;
+			ts_consumed[i] = produced;
+			printf("# overrun ch%u lost=%lu - evt stopped\n",
+			       i + 1, (unsigned long)lost);
+			out_req = OUT_QUIET;
+			return;
+		}
+
+		while (avail--) {
+			uint32_t x = ts_ring[i][ts_consumed[i] & (TS_RING_LEN - 1)];
+			ts_consumed[i]++;
+
+			// X counts down. Modular subtraction accumulates into a 64-bit
+			// tick total, so the 715 s hardware wrap never reaches the wire
+			// and the reported clock is monotonic for the life of the boot.
+			//
+			// The priming sample is consumed silently. ts_ticks does not
+			// advance while capture is stopped, so anchoring on this event and
+			// printing from the next one means the consumer's first delta
+			// after a restart is a genuine interarrival, rather than a span
+			// covering the idle period or a degenerate zero.
+			if (!ts_primed[i]) {
+				ts_primed[i] = true;
+				ts_prev_x[i] = x;
+				continue;
+			}
+			ts_ticks[i] += (uint32_t)(ts_prev_x[i] - x);
+			ts_prev_x[i] = x;
+
+			// Wire format is exactly `E <microseconds> <channel>`, three
+			// tokens. The downstream entropy feeder parses positionally and
+			// rejects any line that is not exactly three fields, so this must
+			// not gain a resolution field without updating that consumer in
+			// lockstep. Capture itself stays at full 166.67 ns resolution.
+			printf("E %llu %u\n",
+			       (unsigned long long)(ts_ticks[i] / ts_per_us), i + 1);
+		}
+	}
+}
+
 bool __no_inline_not_in_flash_func(get_bootsel_button)() {
 	const uint CS_PIN_INDEX = 1;
 	uint32_t flags = save_and_disable_interrupts();
@@ -134,9 +304,10 @@ void gpio_callback(uint gpio, uint32_t events) {
 			ch2_cnt++;
 		}
 
-		if (evt_mode) {
-			printf("E %llu %u\n", time_us_64(), gpio == 22 ? 1 : 2);
-		}
+		// Event timestamps are captured by PIO + DMA, not here. Formatting
+		// them in this handler used to stall it for tens of microseconds and,
+		// because the GPIO edge latch is one sticky bit per pin, any edges
+		// arriving during the stall were merged away rather than queued.
 	}
 }
 
@@ -770,16 +941,15 @@ void SerCmdExec(void) {
 	char buf[24];
 
 	if (memcmp((char*)CmdBuf, "stop", 4) == 0) {
-		sout = false;
-		evt_mode = false;
+		// Last command wins: one strb, no read-modify-write. The main loop
+		// owns sout/evt_mode and all PIO/DMA work, which must not run here.
+		out_req = OUT_QUIET;
 	} else
 	if (memcmp((char*)CmdBuf, "go", 2) == 0) {
-		sout = true;
-		evt_mode = false;
+		out_req = OUT_CPM;
 	} else
 	if (memcmp((char*)CmdBuf, "evt", 3) == 0) {
-		sout = false;
-		evt_mode = true;
+		out_req = OUT_EVT;
 	} else
 	if (memcmp((char*)CmdBuf, "set ", 4) == 0) {
 		ptr = (char*)CmdBuf + 4;
@@ -837,6 +1007,7 @@ void SerCmdExec(void) {
 		printf("gms: %u\r\n", gamma_sensitivity);
 		printf("atc: %u\r\n", alarm_trigger_cpm);
 		printf("hvg: %u\r\n", hvg_pulsewidth);
+		printf("tsl: %lu %lu\r\n", (unsigned long)ts_lost[0], (unsigned long)ts_lost[1]);
 	} else
 	if (memcmp((char*)CmdBuf, "reboot", 6) == 0) {
 		software_reset();
@@ -1176,6 +1347,25 @@ int main() {
 		}
 
 		sleep_ms(25);
+
+		// Reconcile output mode from one snapshot of the requested state, so a
+		// command arriving mid-reconcile is applied whole on the next pass
+		// rather than half-applied now. Converges within one loop iteration.
+		out_mode_t want = out_req;
+
+		if (want == OUT_EVT && !evt_mode) {
+			// No banner: the downstream consumer rejects any line that is not
+			// exactly three whitespace-separated tokens, so a header would be
+			// dead weight at best. The wire format is unchanged from v1.
+			ts_start();
+		}
+
+		sout     = (want == OUT_CPM);
+		evt_mode = (want == OUT_EVT);
+
+		if (evt_mode) {
+			ts_drain();
+		}
 
 		if (tud_cdc_connected()) {
 			while ((c = tud_cdc_read_char()) != -1) {

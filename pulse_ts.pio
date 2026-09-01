@@ -1,0 +1,61 @@
+;
+; Falling-edge timestamper for the GC10next detection line (net DM).
+;
+; Why this exists
+; ---------------
+; The detector is an open-collector pulse into GP22 (and GP2 on the Dual).
+; Capturing it with a GPIO interrupt on the ARM core loses counts, because:
+;
+;   * the 1 Hz timer callback blits the whole 1025-byte OLED framebuffer over
+;     I2C and blocks for ~23 ms, and
+;   * the GPIO edge latch is a single sticky bit per pin, not a counter, so
+;     every edge arriving while the core is busy collapses into one callback.
+;
+; This program moves capture off the core entirely. A DMA channel drains the
+; RX FIFO into a ring buffer, so acquisition keeps running straight through
+; the display refresh, USB traffic, or anything else the core is doing.
+;
+; The timebase
+; ------------
+; X is a free-running 32-bit down-counter. EVERY path through EVERY loop below
+; is exactly 8 SM cycles, which buys two things:
+;
+;   1. X is linear in real time. A loop that skipped cycles while reporting an
+;      edge would be a clock that stops when it is most needed, and would bend
+;      exactly the short-interval statistics this hardware exists to measure.
+;   2. Two state machines started together stay in lockstep forever. That is
+;      how CH1 and CH2 share a single epoch on the Dual.
+;
+; At sys_clk = 48 MHz (set_sys_clock_48mhz) with clkdiv 1, one tick is
+; 8 / 48e6 = 166.667 ns, and X wraps every 2^32 ticks = 715.8 s. Software
+; unwraps by 32-bit modular subtraction between consecutive events.
+;
+; Note the SM only reads the pin, it never drives it, so the pad keeps its SIO
+; function and the existing GPIO interrupt, pull-up, LED and buzzer behaviour
+; are untouched. This capture path is purely additive.
+;
+
+.program pulse_ts
+
+; ---- ARMED: line is high, waiting for the falling edge. 8 cycles/iteration.
+armed:
+    jmp x-- a_tick              ; 1  the target is the next instruction, so the
+a_tick:                         ;    branch is a no-op and this runs purely for
+                                ;    the side effect: X always decrements, and
+                                ;    wraps 0 -> 0xFFFFFFFF.
+    jmp pin a_high              ; 1  pin still high -> keep waiting
+    mov isr, x                  ; 1  falling edge: snapshot the timebase
+    push noblock                ; 1  hand to DMA; drop rather than stall
+    jmp recov           [3]     ; 4  --- 8 cycles
+a_high:
+    jmp armed           [5]     ; 6  --- 8 cycles
+
+; ---- RECOVERING: line is low, waiting for it to return high. 8 cycles/iter.
+; Entered at reset so a line that is already low at startup cannot fake an edge.
+public recov:
+    jmp x-- r_tick              ; 1  keep the timebase running
+r_tick:
+    jmp pin r_high              ; 1  pin back high -> re-arm
+    jmp recov           [5]     ; 6  --- 8 cycles
+r_high:
+    jmp armed           [5]     ; 6  --- 8 cycles

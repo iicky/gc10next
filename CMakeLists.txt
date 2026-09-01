@@ -10,6 +10,8 @@ pico_sdk_init()
 add_executable(main
 	main.c ssd1306.c
 	)
+
+pico_generate_pio_header(main ${CMAKE_CURRENT_LIST_DIR}/pulse_ts.pio)
 pico_enable_stdio_usb(main 1)
 pico_enable_stdio_uart(main 1)
 
@@ -22,4 +24,5 @@ add_compile_definitions(PICO_DEFAULT_UART_RX_PIN=5)
 
 pico_add_extra_outputs(main)
 
-target_link_libraries(main pico_stdlib hardware_adc hardware_pwm hardware_i2c)
+target_link_libraries(main
+	pico_stdlib hardware_adc hardware_pwm hardware_i2c hardware_pio hardware_dma)
