@@ -12,6 +12,11 @@ pico_sdk_init()
 # add_executable() to apply to the target.
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
+# Commit id for the firmware version string; passed in by the build.
+if(NOT DEFINED FW_BUILD_ID)
+	set(FW_BUILD_ID "dev")
+endif()
+
 add_executable(main
 	main.c ssd1306.c
 	)
@@ -26,6 +31,8 @@ pico_enable_stdio_uart(main 1)
 add_compile_definitions(PICO_DEFAULT_UART=1)
 add_compile_definitions(PICO_DEFAULT_UART_TX_PIN=4)
 add_compile_definitions(PICO_DEFAULT_UART_RX_PIN=5)
+
+target_compile_definitions(main PRIVATE FW_BUILD_ID="${FW_BUILD_ID}")
 
 pico_add_extra_outputs(main)
 

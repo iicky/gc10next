@@ -20,6 +20,7 @@
 #include "hardware/sync.h"
 #include "hardware/i2c.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
 #include "hardware/pio.h"
@@ -31,7 +32,16 @@
 #include "image.h"
 #include "pulse_ts.pio.h"
 
-#define FW_VERSION "FWNX1H03"
+// Firmware id. Upstream uses "FWNX1R<nn>" and this fork's main used
+// "FWNX1E01" -- both are `FWNX1` + one letter + two digits, so the letter
+// space is shared and any id of that shape could collide with a future
+// upstream release, or be mistaken for one. Use a shape upstream will not
+// emit, and carry the commit so a deployed board is traceable to source.
+// FW_BUILD_ID is injected by CMake; 15 chars fits the splash at x=30.
+#ifndef FW_BUILD_ID
+#define FW_BUILD_ID "dev"
+#endif
+#define FW_VERSION "NX1fork-" FW_BUILD_ID
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
@@ -151,6 +161,19 @@ static volatile bool     ui_refresh_req = false;   // redraw the measurement scr
 static volatile bool     cpm_out_pending = false;  // a CPM value is due on the wire
 static volatile uint32_t cpm_out_value = 0;
 static volatile uint32_t eeprom_err = 0;   // I2C failures, reported by `show`
+
+// Silent-reboot telemetry: CONSECUTIVE watchdog resets since power-on, not a
+// general reset count -- any non-watchdog reset (power cycle, BOOTSEL, DFU)
+// correctly clears it back to zero.
+// Watchdog scratch registers survive a watchdog reset
+// but are cleared by a power cycle, which is exactly the distinction worth
+// reporting: "has this board rebooted itself since it was plugged in?" Without
+// it, a watchdog recovery is invisible -- counters restart and the host sees a
+// healthy device, which is how the original lockup went unexplained. Scratch
+// 0..3 are free; the SDK uses 4..7 for its own reboot magic. A deliberate
+// `reboot` is tagged so only unexplained resets are counted. Note a fresh
+// picotool load can still show 1, since it reboots outside our control.
+static uint32_t wdt_reboots = 0;
 
 // UART receive ring. The interrupt stores bytes and does nothing else, so no
 // blocking work runs in interrupt context, but no input is dropped either:
@@ -775,7 +798,14 @@ void dispCPM(void) {
 	cpm_out_pending = true;
 }
 
+// The `reboot` command goes through the watchdog, so tag it or it would look
+// like a fault. This only covers reboots we initiate: an external picotool
+// reflash resets the chip outside our control and will still show up as one
+// unexplained reset. Unplugging clears it.
+#define WDT_INTENTIONAL 0x5245424fu   // 'REBO'
+
 void software_reset() {
+	watchdog_hw->scratch[1] = WDT_INTENTIONAL;
 	watchdog_enable(1, 1);
 	while(1);
 }
@@ -1017,6 +1047,8 @@ void SerCmdExec(void) {
 		printf("hvg: %u\r\n", hvg_pulsewidth);
 		printf("tsl: %lu %lu\r\n", (unsigned long)ts_lost[0], (unsigned long)ts_lost[1]);
 		printf("eer: %lu\r\n", (unsigned long)eeprom_err);
+		printf("ots: %lu\r\n", (unsigned long)uptime);
+		printf("wdt: %lu\r\n", (unsigned long)wdt_reboots);
 	} else
 	if (memcmp((char*)CmdBuf, "reboot", 6) == 0) {
 		software_reset();
@@ -1216,6 +1248,16 @@ int main() {
 	static repeating_timer_t secTimer;
 
 	set_sys_clock_48mhz();
+
+	if (!watchdog_caused_reboot()) {
+		wdt_reboots = 0;                       // power-on clears the history
+	} else if (watchdog_hw->scratch[1] == WDT_INTENTIONAL) {
+		wdt_reboots = watchdog_hw->scratch[0]; // `reboot`/reflash: not a fault
+	} else {
+		wdt_reboots = watchdog_hw->scratch[0] + 1;
+	}
+	watchdog_hw->scratch[0] = wdt_reboots;
+	watchdog_hw->scratch[1] = 0;
 
 	stdio_init_all();
 
