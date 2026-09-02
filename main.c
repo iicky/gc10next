@@ -50,6 +50,20 @@
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
+// Front-panel button (BOOTSEL). Sampling it masks interrupts (see
+// get_bootsel_button), so poll only every Nth loop pass and judge the gesture
+// by wall-clock hold time rather than by a poll count, so the thresholds stay
+// fixed if the loop rate changes. ~500 ms matches the pre-existing long-press
+// feel (21 polls x ~25 ms under the old every-pass polling).
+// 2, not 4: the settle cut below already takes the masked window from ~146 us
+// to ~29 us, so every 2nd pass costs 0.058% interrupts-off duty against 0.029%
+// for every 4th. That 0.029% of counts is far inside Poisson noise and affects
+// only the display counters, never the PIO capture path -- not worth risking a
+// missed tap on the board's only control, since a press must span a poll to be
+// seen at all.
+#define BOOTSEL_POLL_DIV 2      // poll every 2nd pass (~50 ms)
+#define LONGPRESS_MS     500u   // held >= this = long press, else short press
+
 const uint LED_PIN = 25;
 const float conversion_factor = 3.3f / ( 1 << 12) * 3;
 
@@ -90,7 +104,6 @@ uint32_t cpm;
 uint32_t sma[4];
 uint16_t cbuf[20];
 volatile uint16_t cpx;
-uint16_t lp;	// Long button press detection counter
 
 uint16_t cnt = 0;
 uint16_t fifocpm[TOTAL_NUM];
@@ -399,13 +412,25 @@ static void ts_drain(void) {
 
 bool __no_inline_not_in_flash_func(get_bootsel_button)() {
 	const uint CS_PIN_INDEX = 1;
+
+	// The mask must stay. To sample BOOTSEL we force the QSPI chip-select pad
+	// to input, and while that override is in place the pad cannot drive flash
+	// CS. Any flash access in this window would fault, including an interrupt
+	// vectoring into an ISR fetched from XIP flash, so interrupts are disabled
+	// for the whole read. Do not delete this to "save cycles".
 	uint32_t flags = save_and_disable_interrupts();
 
 	hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
 			GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
 			IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
 
-	for (volatile int i = 0; i < 1000; ++i);
+	// Let the pad settle before sampling. The count of 1000 came from an
+	// upstream example written for a 125 MHz core; at our 48 MHz core
+	// (set_sys_clock_48mhz) it stretches to ~145 us of interrupts-off time,
+	// far beyond the sub-microsecond RC settle the pad needs. 200 iterations is
+	// ~30 us here, which keeps a wide margin while cutting the masked window
+	// ~5x so the count detector merges away far fewer edges.
+	for (volatile int i = 0; i < 200; ++i);
 
 	bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
 
@@ -1616,45 +1641,58 @@ int main() {
 
 	int c;
 
+	// BOOTSEL button state: a pass divider so we poll only every Nth iteration,
+	// and the wall-clock timestamp of the current press so its duration is
+	// measured against a real clock rather than a poll count.
+	uint8_t  bootsel_div = 0;
+	uint32_t press_start_ms = 0;
+
 	// Tighten the window now that init is done. The loop period is 25 ms plus a
 	// display blit, so 3 s is far more headroom than any iteration needs.
 	watchdog_enable(3000, 1);
 
 	while(1) {
 
-		if (get_bootsel_button()) {
-			if (is_button_pressed) {
-			}
-			lp++;
-			is_button_pressed = true;
-		} else {
-			if (lp > 20) {
-				if (is_sound_enabled == true) {
-					is_sound_enabled = false;
-					eeprom_write_byte(OFS_SOUND, 0);
-					lp = 0;
+		// Poll BOOTSEL every BOOTSEL_POLL_DIV passes (~100 ms) instead of every
+		// pass. The old code sampled it every ~25 ms, holding interrupts off
+		// ~145 us each time (~0.6% duty); since the GPIO edge latch is one
+		// sticky bit per pin, counts arriving in that window collapsed into a
+		// single callback and were lost. Both the coarser cadence and the
+		// shorter settle in get_bootsel_button cut that. The action fires on
+		// release, and the hold duration is measured against the real clock so
+		// the short/long boundary is fixed at LONGPRESS_MS regardless of cadence.
+		if (++bootsel_div >= BOOTSEL_POLL_DIV) {
+			bootsel_div = 0;
+
+			if (get_bootsel_button()) {
+				if (!is_button_pressed) {
+					is_button_pressed = true;
+					press_start_ms = to_ms_since_boot(get_absolute_time());
+				}
+			} else if (is_button_pressed) {
+				is_button_pressed = false;
+				uint32_t held_ms =
+					to_ms_since_boot(get_absolute_time()) - press_start_ms;
+
+				if (held_ms >= LONGPRESS_MS) {
+					// Long press: toggle the click sound and persist it.
+					is_sound_enabled = !is_sound_enabled;
+					eeprom_write_byte(OFS_SOUND,
+							is_sound_enabled ? 1 : 0);
 				} else {
-					is_sound_enabled = true;
-					eeprom_write_byte(OFS_SOUND, 1);
-					lp = 0;
+					// Short press: advance the display mode and persist it.
+					dispMode++;
+					if (dispMode > MODEMAX) {
+						dispMode = 0;
+					}
+					// Persist the choice. Button-driven, so this is rare
+					// enough that the ~10 ms interrupts-off window in the
+					// write costs at most a single count, and it matches
+					// what the long press already does for the mute setting.
+					eeprom_write_byte(OFS_DISPMODE, dispMode);
+					pd = true;
 				}
 			}
-
-			if (lp <= 20 &&  lp > 0) {
-				dispMode++;
-				if (dispMode > MODEMAX) {
-					dispMode = 0;
-				}
-				// Persist the choice. Button-driven, so this is rare enough
-				// that the ~10 ms interrupts-off window in the write costs at
-				// most a single count, and it matches what the long press
-				// already does for the mute setting.
-				eeprom_write_byte(OFS_DISPMODE, dispMode);
-				pd = true;
-			}
-
-			is_button_pressed = false;
-			lp = 0;
 		}
 
 		sleep_ms(25);
