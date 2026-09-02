@@ -13,10 +13,16 @@ pico_sdk_init()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 # Commit id for the firmware version string. Derived from git when building
-# from a checkout; the Docker build has no .git, so it passes -DFW_BUILD_ID
-# explicitly. A trailing '+' means the tree had uncommitted changes, so the
-# hash alone would not describe what is actually running.
-if(NOT DEFINED FW_BUILD_ID)
+# from a checkout. The Docker build has no .git and must pass -DFW_BUILD_ID
+# explicitly; it refuses to build without it, so a container image can never
+# be labelled with a commit it was not built from. A trailing '+' means the
+# tree had uncommitted changes, so the hash alone would not describe what is
+# actually running.
+#
+# An empty -DFW_BUILD_ID counts as unset: passing one through an undefined
+# shell variable defines the cache entry as "", which would otherwise skip
+# the derivation below and silently ship a bare "FWNX1E-".
+if(NOT DEFINED FW_BUILD_ID OR FW_BUILD_ID STREQUAL "")
 	find_package(Git QUIET)
 	if(GIT_FOUND)
 		execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
@@ -34,7 +40,7 @@ if(NOT DEFINED FW_BUILD_ID)
 		endif()
 	endif()
 endif()
-if(NOT DEFINED FW_BUILD_ID)
+if(NOT DEFINED FW_BUILD_ID OR FW_BUILD_ID STREQUAL "")
 	set(FW_BUILD_ID "dev")
 endif()
 message(STATUS "Firmware build id: ${FW_BUILD_ID}")
