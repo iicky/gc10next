@@ -190,7 +190,7 @@ void ssd13606_draw_empty_square(ssd1306_t *p, uint32_t x, uint32_t y, uint32_t w
 }
 
 void ssd1306_draw_char_with_font(ssd1306_t *p, uint32_t x, uint32_t y, uint32_t scale, const uint8_t *font, char c) {
-    if(c > '~')
+    if(c < ' ' || c > '~')   // font table starts at 0x20 (space); c<0x20 would index before it
         return;
 
     for(uint8_t i=0; i<font[1]; ++i) {
@@ -251,10 +251,17 @@ void ssd1306_bmp_show_image_with_offset(ssd1306_t *p, const uint8_t *data, const
     const int table_start=14+biSize;
     uint8_t color_val = 0;   // palette scan below may not match
 
-    for(uint8_t i=0; i<2; ++i) {
-        if(!((data[table_start+i*4]<<16)|(data[table_start+i*4+1]<<8)|data[table_start+i*4+2])) {
-            color_val=i;
-            break;
+    // size is only guaranteed >=54, but the 2-entry (8-byte) palette sits at
+    // 14+biSize, which for a 40-byte BITMAPINFOHEADER already runs past a
+    // 54-byte input. Only scan when both palette entries are in bounds;
+    // otherwise leave color_val at its default 0 (a valid interpretation)
+    // rather than read off the end of an absent/truncated palette.
+    if(table_start>=0 && (long)table_start+8<=size) {
+        for(uint8_t i=0; i<2; ++i) {
+            if(!((data[table_start+i*4]<<16)|(data[table_start+i*4+1]<<8)|data[table_start+i*4+2])) {
+                color_val=i;
+                break;
+            }
         }
     }
 
@@ -266,8 +273,15 @@ void ssd1306_bmp_show_image_with_offset(ssd1306_t *p, const uint8_t *data, const
 
     int step=biHeight>0?-1:1;
     int border=biHeight>0?-1:biHeight;
-    for(uint32_t y=biHeight>0?biHeight-1:0; y!=border; y+=step) {
-        for(uint32_t x=0; x<biWidth; ++x) {
+    // The counters are unsigned on purpose: for a bottom-up BMP (biHeight>0)
+    // y counts down from biHeight-1 and terminates by wraparound -- (uint32_t)0
+    // minus 1 becomes 0xFFFFFFFF, which is exactly (uint32_t)border for the -1
+    // border. The casts below just make explicit the unsigned conversion the
+    // compiler was already performing, silencing -Wsign-compare WITHOUT changing
+    // which values are compared for either height sign. Do not "fix" this to a
+    // signed counter: that would break the wraparound termination.
+    for(uint32_t y=biHeight>0?biHeight-1:0; y!=(uint32_t)border; y+=step) {
+        for(uint32_t x=0; x<(uint32_t)biWidth; ++x) {
             if(((img_data[x>>3]>>(7-(x&7)))&1)==color_val)
                 ssd1306_draw_pixel(p, x_offset+x, y_offset+y);
         }
