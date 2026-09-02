@@ -33,10 +33,18 @@ SOFTWARE.
 #include "ssd1306.h"
 #include "font.h"
 
-inline static void swap(uint32_t *a, uint32_t *b) {
-    uint32_t *t=a;
+// This was silently broken: it copied the POINTER (uint32_t *t=a), so *t
+// aliased *a. After *a=*b the write-back *b=*t just copied *b onto itself and
+// both operands ended up holding the original *b -- every x1>x2 or bottom-to-top
+// line in ssd1306_draw_line collapsed to a single pixel. Fixed to swap the value
+// through a scalar temp.
+// Typed int32_t to match ssd1306_draw_line -- its only caller, which passes
+// &int32_t locals. The old uint32_t* signature only "worked" because the bit
+// patterns are identical; int32_t removes the type mismatch at the call sites.
+inline static void swap(int32_t *a, int32_t *b) {
+    int32_t t=*a;
     *a=*b;
-    *b=*t;
+    *b=t;
 }
 
 inline static void fancy_write(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, char *name) {
