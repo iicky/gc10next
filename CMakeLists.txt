@@ -17,8 +17,10 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 # nothing: it only forces the caller to supply an id rather than defaulting to
 # "dev". Whether that id describes the copied source is the caller's
 # responsibility, and a wrong value still yields a wrongly labelled image.
-# A trailing '+' means the tree had uncommitted changes, so the hash alone
-# would not describe what is actually running.
+# A trailing '+' means the checkout did not match the commit exactly, whether
+# from modified tracked files or new untracked ones, so the hash alone would
+# not describe what is actually running. Ignored paths (build trees, a vendored
+# SDK) are excluded, so they never trip it.
 #
 # An empty -DFW_BUILD_ID counts as unset: passing one through an undefined
 # shell variable defines the cache entry as "", which would otherwise skip
@@ -31,10 +33,11 @@ if(NOT DEFINED FW_BUILD_ID OR FW_BUILD_ID STREQUAL "")
 			OUTPUT_VARIABLE _fw_sha OUTPUT_STRIP_TRAILING_WHITESPACE
 			ERROR_QUIET RESULT_VARIABLE _fw_rc)
 		if(_fw_rc EQUAL 0)
-			execute_process(COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD
+			execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain
 				WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-				RESULT_VARIABLE _fw_dirty)
-			if(NOT _fw_dirty EQUAL 0)
+				OUTPUT_VARIABLE _fw_dirty OUTPUT_STRIP_TRAILING_WHITESPACE
+				ERROR_QUIET)
+			if(NOT _fw_dirty STREQUAL "")
 				set(_fw_sha "${_fw_sha}+")
 			endif()
 			set(FW_BUILD_ID "${_fw_sha}")
