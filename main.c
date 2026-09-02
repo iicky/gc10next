@@ -30,7 +30,7 @@
 #include "image.h"
 #include "pulse_ts.pio.h"
 
-#define FW_VERSION "FWNX1H01"
+#define FW_VERSION "FWNX1H02"
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
@@ -149,6 +149,28 @@ static volatile out_mode_t out_req = OUT_CPM;
 static volatile bool     ui_refresh_req = false;   // redraw the measurement screen
 static volatile bool     cpm_out_pending = false;  // a CPM value is due on the wire
 static volatile uint32_t cpm_out_value = 0;
+static volatile uint32_t eeprom_err = 0;   // I2C failures, reported by `show`
+
+// UART receive ring. The interrupt stores bytes and does nothing else, so no
+// blocking work runs in interrupt context, but no input is dropped either:
+// polling alone would lose data, because the RX FIFO holds 32 bytes (2.8 ms at
+// 115200) while the main loop can be away for ~50 ms during a display redraw.
+// Single producer in the IRQ, single consumer in the loop, power-of-two size,
+// so it needs no locking on one core.
+#define URX_LEN 256u
+static volatile uint8_t  urx_buf[URX_LEN];
+static volatile uint16_t urx_head = 0, urx_tail = 0;
+
+static void on_uart_rx(void) {
+	while (uart_is_readable(uart1)) {
+		uint8_t ch = uart_getc(uart1);
+		uint16_t next = (urx_head + 1u) & (URX_LEN - 1u);
+		if (next != urx_tail) {          // full: drop, never block in an IRQ
+			urx_buf[urx_head] = ch;
+			urx_head = next;
+		}
+	}
+}
 
 // Total words the DMA has written since it was armed. transfer_count reads
 // back as the remaining count, and we arm with 0xFFFFFFFF.
@@ -645,10 +667,10 @@ void dispCPM(void) {
 		ssd1306_draw_line(&disp, 98, 35, 102, 35);
 		ssd1306_draw_line(&disp, 98, 63, 102, 63);
 
-		sprintf(buf,  "%lu", cmax);
+		sprintf(buf,  "%d", (int)cmax);
 		ssd1306_draw_string(&disp, 104, 36, 1, buf);
 
-		sprintf(buf,  "%lu", cmin);
+		sprintf(buf,  "%d", (int)cmin);
 		ssd1306_draw_string(&disp, 104, 56, 1, buf);
 
 		ssd1306_show(&disp);
@@ -764,16 +786,10 @@ void eeprom_write_byte (uint16_t addr, uint8_t val) {
 	src[0] = addr & 0xFF;
 	src[1] = val;
 
-	switch(i2c_write_blocking(i2c_default, 0x50, src, 2, false)) {
-		case PICO_ERROR_GENERIC:
-			printf("[%s] addr not acknowledged!\n");
-			 break;
-		case PICO_ERROR_TIMEOUT:
-			printf("[%s] timeout!\n");
-			break;
-		default:
-			break;
-	}
+	// No printf here: this runs with interrupts disabled, and the original
+	// calls passed no argument for %s, so any bus error dereferenced a junk
+	// pointer. Count the failure and let the main loop report it.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 2, false, 10000) < 0) eeprom_err++;
 	restore_interrupts(flags);
 
 	sleep_ms(5);
@@ -787,16 +803,10 @@ void eeprom_write_word (uint16_t addr, uint16_t val) {
 	src[1] = val  & 0xFF;
 	src[2] = val >> 8;
 
-	switch(i2c_write_blocking(i2c_default, 0x50, src, 3, false)) {
-		case PICO_ERROR_GENERIC:
-			printf("[%s] addr not acknowledged!\n");
-			 break;
-		case PICO_ERROR_TIMEOUT:
-			printf("[%s] timeout!\n");
-			break;
-		default:
-			break;
-	}
+	// No printf here: this runs with interrupts disabled, and the original
+	// calls passed no argument for %s, so any bus error dereferenced a junk
+	// pointer. Count the failure and let the main loop report it.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 3, false, 10000) < 0) eeprom_err++;
 	restore_interrupts(flags);
 
 	sleep_ms(5);
@@ -812,16 +822,10 @@ void eeprom_write_long (uint16_t addr, uint32_t val) {
 	src[3] = (val >> 16) & 0xFF;
 	src[4] = (val >> 24) & 0xFF;
 
-	switch(i2c_write_blocking(i2c_default, 0x50, src, 5, false)) {
-		case PICO_ERROR_GENERIC:
-			printf("[%s] addr not acknowledged!\n");
-			 break;
-		case PICO_ERROR_TIMEOUT:
-			printf("[%s] timeout!\n");
-			break;
-		default:
-			break;
-	}
+	// No printf here: this runs with interrupts disabled, and the original
+	// calls passed no argument for %s, so any bus error dereferenced a junk
+	// pointer. Count the failure and let the main loop report it.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 5, false, 10000) < 0) eeprom_err++;
 	restore_interrupts(flags);
 
 	sleep_ms(5);
@@ -836,13 +840,13 @@ int eeprom_read_byte(int addr, uint8_t *p)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
     }
 
-    ret = i2c_read_blocking(i2c_default, 0x50, &rx, 1, false);
+    ret = i2c_read_timeout_us(i2c_default, 0x50, &rx, 1, false, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
@@ -864,13 +868,13 @@ int eeprom_read_word(int addr, uint16_t *p)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
     }
 
-    ret = i2c_read_blocking(i2c_default, 0x50, rx, 2, false);
+    ret = i2c_read_timeout_us(i2c_default, 0x50, rx, 2, false, 10000);
     if (ret != 2) {
 		restore_interrupts(flags);
 		return ret;
@@ -892,13 +896,13 @@ int eeprom_read_long(int addr, uint32_t *p)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
     }
 
-    ret = i2c_read_blocking(i2c_default, 0x50, rx, 4, false);
+    ret = i2c_read_timeout_us(i2c_default, 0x50, rx, 4, false, 10000);
     if (ret != 4) {
 		restore_interrupts(flags);
 		return ret;
@@ -920,13 +924,13 @@ int eeprom_read_page(int addr, uint8_t *p, size_t len)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
 	if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
 	}
 
-	ret = i2c_read_blocking(i2c_default, 0x50, rx, len, false);
+	ret = i2c_read_timeout_us(i2c_default, 0x50, rx, len, false, 10000);
 	if (ret != len) {
 		restore_interrupts(flags);
 		return ret;
@@ -1011,6 +1015,7 @@ void SerCmdExec(void) {
 		printf("atc: %u\r\n", alarm_trigger_cpm);
 		printf("hvg: %u\r\n", hvg_pulsewidth);
 		printf("tsl: %lu %lu\r\n", (unsigned long)ts_lost[0], (unsigned long)ts_lost[1]);
+		printf("eer: %lu\r\n", (unsigned long)eeprom_err);
 	} else
 	if (memcmp((char*)CmdBuf, "reboot", 6) == 0) {
 		software_reset();
@@ -1212,6 +1217,13 @@ int main() {
 
 	stdio_init_all();
 
+	// Armed before any I2C. The EEPROM and OLED helpers block, and the EEPROM
+	// ones do so with interrupts disabled, so a stuck bus during init would hang
+	// forever with no way back except physically holding BOOTSEL. The window is
+	// generous because init legitimately takes a while; the main loop tightens
+	// it to 3 s once running.
+	watchdog_enable(8000, 1);
+
 	// Futer Use (battery)
 	adc_init();
 	adc_gpio_init(29);
@@ -1226,10 +1238,13 @@ int main() {
 	gpio_pull_up(21);
 	bi_decl(bi_2pins_with_func(20, 21, GPIO_FUNC_I2C));
 
-	// UART. Deliberately no RX interrupt: the main loop polls uart_is_readable
-	// so command parsing (and the printf echo it performs) stays in thread
-	// context, and so both transports cannot write CmdBuf concurrently.
+	// UART. The RX interrupt only fills urx_buf; commands are parsed in the main
+	// loop, so the printf echo stays out of interrupt context and both transports
+	// feed one parser instead of racing on CmdBuf.
 	//uart_set_baudrate(uart1, 9600);
+	irq_set_exclusive_handler(UART1_IRQ, on_uart_rx);
+	irq_set_enabled(UART1_IRQ, true);
+	uart_set_irq_enables(uart1, true, false);
 
 	// OLED
 	i2c_init(i2c1, 400000);
@@ -1241,12 +1256,14 @@ int main() {
 	disp.external_vcc = false;
 	ssd1306_init(&disp, 128, 64, 0x3C, i2c1);
 
+	watchdog_update();
 	uint8_t mn[8];
 	eeprom_read_page(OFS_MODELNAME, mn, 8);
-	if (strcmp(mn, "GC10nxd") == 0) {
+	if (strcmp((const char *)mn, "GC10nxd") == 0) {
 		isDual = true;
 	}
 
+	watchdog_update();
 	title();
 
 	uint8_t soundMode;
@@ -1327,10 +1344,8 @@ int main() {
 
 	int c;
 
-	// Last resort. If the main loop ever stops feeding this, the board reboots
-	// itself instead of sitting wedged until someone can reach the BOOTSEL
-	// button. The loop period is 25 ms plus a display blit, so 3 s is far more
-	// headroom than any legitimate iteration needs.
+	// Tighten the window now that init is done. The loop period is 25 ms plus a
+	// display blit, so 3 s is far more headroom than any iteration needs.
 	watchdog_enable(3000, 1);
 
 	while(1) {
@@ -1404,8 +1419,10 @@ int main() {
 		// Commands from both transports are parsed here, in thread context.
 		// Previously UART bytes were parsed inside UART1_IRQ, which put printf
 		// in an interrupt and let two transports write CmdBuf concurrently.
-		while (uart_is_readable(uart1)) {
-			SerCmdProc(uart_getc(uart1));
+		while (urx_tail != urx_head) {
+			uint8_t ch = urx_buf[urx_tail];
+			urx_tail = (urx_tail + 1u) & (URX_LEN - 1u);
+			SerCmdProc(ch);
 		}
 		if (tud_cdc_connected()) {
 			while ((c = tud_cdc_read_char()) != -1) {
