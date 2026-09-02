@@ -1099,25 +1099,27 @@ void SerCmdExec(void) {
 		if (memcmp(ptr, "hvg=", 4) == 0) {
 			// Bounded to the range the slice can actually express: 1..wrap.
 			//
-			// 0 is excluded for the same reason the boot path refuses it.
-			// Under this slice's inverted polarity, high-side duty is
-			// (wrap+1-level)/(wrap+1), so level 0 is 100% duty into the HV
-			// generator -- the maximum-energy extreme. Rejecting it at boot
-			// but honouring it here would have made the validation
-			// decorative.
-			//
 			// Above the wrap the comparator never trips and the channel
 			// saturates, so a larger number does not mean a larger pulse; it
 			// means the reported setting stops describing what drives the
-			// tube. Between those ends the firmware has no basis to judge a
-			// safe bias for a given tube, so it does not narrow further.
+			// tube. 0 is excluded because the boot guard treats it as the
+			// marker for an unreadable cell, and honouring it here would make
+			// that validation bypassable.
+			//
+			// No claim is made about which end of 1..2047 is safer. The
+			// obvious reading of the inverted polarity turned out to be
+			// wrong on this hardware -- 2047 was measured still counting
+			// normally -- so within the expressible range the operator's
+			// value stands as given.
 			long v = atol(ptr + 4);
 			if (v < 1)    v = 1;
 			if (v > 2047) v = 2047;
 			hvg_pulsewidth = (uint16_t)v;
-			// The operator has asserted a value, so it is savable again.
+			// The operator has asserted a value, so it is savable again, and
+			// this is the way back from a generator parked at boot.
 			hvg_trusted = true;
 			pwm_set_chan_level(hvgPwmSlice, PWM_CHAN_A, hvg_pulsewidth);
+			pwm_set_enabled(hvgPwmSlice, true);
 		} else
 		if (memcmp(ptr, "bps=", 4) == 0) {
 			uint32_t bps;
@@ -1510,22 +1512,27 @@ int main() {
 	// Validate before this ever reaches the PWM.
 	//
 	// hvg_pulsewidth is a global initialised to 0, and eeprom_read_word
-	// leaves its target untouched when the I2C transfer fails -- so a stuck
-	// bus left 0 here, and 0 against this slice is the maximum-energy end of
-	// the range, not the minimum: the slice runs with inverted polarity, so
-	// high-side duty is (wrap+1-level)/(wrap+1). Level 0 is 100% duty into
-	// the HV generator. An erased cell (0xFFFF) exceeds the 2047 wrap and
-	// saturates the other way.
+	// leaves its target untouched when the I2C transfer fails, so a stuck bus
+	// left 0 here and sent it straight to the generator. An erased cell
+	// (0xFFFF) exceeds the 2047 wrap, where the comparator never trips and
+	// the channel saturates. Neither is a calibration and neither should be
+	// applied.
 	//
-	// Neither is a calibration, so neither should be applied. This firmware
-	// has no way to know a safe bias for a given tube, so it refuses to
-	// invent one: an implausible stored value parks the generator at the
-	// minimum-energy end and says so, rather than guessing a voltage. The
-	// board then reads zero counts, which the no-signal supervision reports.
+	// What this deliberately does NOT do is substitute a "safe" level. An
+	// earlier version of this guard parked the slice at 2047 on the reasoning
+	// that inverted polarity makes high levels the low-duty end. Measurement
+	// disproved it: driven at 2047 the tube kept counting at its normal rate
+	// for 80 s, so that level is not the quiet end and the substitution was
+	// picking an unknown bias.
+	//
+	// Switching is disabled instead. With the slice stopped the converter
+	// cannot pump at all, which is the low-energy state regardless of which
+	// polarity or duty convention the hardware uses -- no assumption needed.
+	// The board then reads zero counts, which the no-signal supervision
+	// reports, and `set hvg` re-enables the generator.
 	eeprom_read_word(OFS_PWM_WIDTH, &hvg_pulsewidth);
 	if (hvg_pulsewidth == 0 || hvg_pulsewidth > 2047) {
-		hvg_pulsewidth = 2047;
-		hvg_trusted = false;
+		hvg_trusted = false;   // value kept as-is so `show` reveals what was stored
 	}
 
 	gpio_init(LED_PIN);		// DETECTION INDICATOR LED
@@ -1538,9 +1545,10 @@ int main() {
 	hvgPwmSlice = pwm_gpio_to_slice_num(10);	// GPIO10 for HV gen pulse
 	pwm_set_clkdiv(hvgPwmSlice, 6);
 	pwm_set_wrap(hvgPwmSlice, 2047);
-	pwm_set_chan_level(hvgPwmSlice, PWM_CHAN_A, hvg_pulsewidth);
+	pwm_set_chan_level(hvgPwmSlice, PWM_CHAN_A, hvg_trusted ? hvg_pulsewidth : 0);
 	pwm_set_output_polarity(hvgPwmSlice, true, true);
-	pwm_set_enabled(hvgPwmSlice, true);
+	// Not enabled when the stored width was unusable: see above.
+	pwm_set_enabled(hvgPwmSlice, hvg_trusted);
 
 	// Buzzer
 	bzsPwmSlice = pwm_gpio_to_slice_num(16);	// GPIO16 for BZ
