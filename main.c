@@ -37,11 +37,15 @@
 // space is shared and any id of that shape could collide with a future
 // upstream release, or be mistaken for one. Use a shape upstream will not
 // emit, and carry the commit so a deployed board is traceable to source.
-// FW_BUILD_ID is injected by CMake; 15 chars fits the splash at x=30.
+// FW_BUILD_ID comes from git (or -DFW_BUILD_ID for the Docker build, which
+// has no .git). "E" is for entropy, this fork's purpose. Dropping the
+// release counter is deliberate: upstream emits sequence numbers, this
+// emits a commit, so the two can never be confused. 15 chars fits the
+// splash at x=30 (5px font + 1px gap, 98px from x=30).
 #ifndef FW_BUILD_ID
 #define FW_BUILD_ID "dev"
 #endif
-#define FW_VERSION "NX1fork-" FW_BUILD_ID
+#define FW_VERSION "FWNX1E-" FW_BUILD_ID
 #define MODEMAX 2
 #define TOTAL_NUM 300
 

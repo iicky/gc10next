@@ -12,10 +12,32 @@ pico_sdk_init()
 # add_executable() to apply to the target.
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
-# Commit id for the firmware version string; passed in by the build.
+# Commit id for the firmware version string. Derived from git when building
+# from a checkout; the Docker build has no .git, so it passes -DFW_BUILD_ID
+# explicitly. A trailing '+' means the tree had uncommitted changes, so the
+# hash alone would not describe what is actually running.
+if(NOT DEFINED FW_BUILD_ID)
+	find_package(Git QUIET)
+	if(GIT_FOUND)
+		execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
+			WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+			OUTPUT_VARIABLE _fw_sha OUTPUT_STRIP_TRAILING_WHITESPACE
+			ERROR_QUIET RESULT_VARIABLE _fw_rc)
+		if(_fw_rc EQUAL 0)
+			execute_process(COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD
+				WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+				RESULT_VARIABLE _fw_dirty)
+			if(NOT _fw_dirty EQUAL 0)
+				set(_fw_sha "${_fw_sha}+")
+			endif()
+			set(FW_BUILD_ID "${_fw_sha}")
+		endif()
+	endif()
+endif()
 if(NOT DEFINED FW_BUILD_ID)
 	set(FW_BUILD_ID "dev")
 endif()
+message(STATUS "Firmware build id: ${FW_BUILD_ID}")
 
 add_executable(main
 	main.c ssd1306.c
