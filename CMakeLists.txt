@@ -7,16 +7,56 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
+# The original build enabled no warnings at all, which is how a printf with a
+# %s and no argument survived in the EEPROM error path. Must precede
+# add_executable() to apply to the target.
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
+# Commit id for the firmware version string. Derived from git when building
+# from a checkout; the Docker build has no .git, so it passes -DFW_BUILD_ID
+# explicitly. A trailing '+' means the tree had uncommitted changes, so the
+# hash alone would not describe what is actually running.
+if(NOT DEFINED FW_BUILD_ID)
+	find_package(Git QUIET)
+	if(GIT_FOUND)
+		execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
+			WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+			OUTPUT_VARIABLE _fw_sha OUTPUT_STRIP_TRAILING_WHITESPACE
+			ERROR_QUIET RESULT_VARIABLE _fw_rc)
+		if(_fw_rc EQUAL 0)
+			execute_process(COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD
+				WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+				RESULT_VARIABLE _fw_dirty)
+			if(NOT _fw_dirty EQUAL 0)
+				set(_fw_sha "${_fw_sha}+")
+			endif()
+			set(FW_BUILD_ID "${_fw_sha}")
+		endif()
+	endif()
+endif()
+if(NOT DEFINED FW_BUILD_ID)
+	set(FW_BUILD_ID "dev")
+endif()
+message(STATUS "Firmware build id: ${FW_BUILD_ID}")
+
 add_executable(main
 	main.c ssd1306.c
 	)
+
+pico_generate_pio_header(main ${CMAKE_CURRENT_LIST_DIR}/pulse_ts.pio)
 pico_enable_stdio_usb(main 1)
 pico_enable_stdio_uart(main 1)
 
-add_compile_definitions(PICO_DEFAULT_UART_INSTANCE=uart1)
+# SDK 2.x made PICO_DEFAULT_UART_INSTANCE a function-like macro, so defining it
+# to `uart1` broke every translation unit. Select the instance by index instead:
+# this spelling works on both SDK 1.5.x and 2.x.
+add_compile_definitions(PICO_DEFAULT_UART=1)
 add_compile_definitions(PICO_DEFAULT_UART_TX_PIN=4)
 add_compile_definitions(PICO_DEFAULT_UART_RX_PIN=5)
 
+target_compile_definitions(main PRIVATE FW_BUILD_ID="${FW_BUILD_ID}")
+
 pico_add_extra_outputs(main)
 
-target_link_libraries(main pico_stdlib hardware_adc hardware_pwm hardware_i2c)
+target_link_libraries(main
+	pico_stdlib hardware_adc hardware_pwm hardware_i2c hardware_pio hardware_dma)

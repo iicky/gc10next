@@ -11,10 +11,11 @@ RUN git clone https://github.com/raspberrypi/pico-sdk.git /pico-sdk \
 
 ENV PICO_SDK_PATH=/pico-sdk
 
+ARG FW_BUILD_ID=dev
 WORKDIR /src
-COPY main.c ssd1306.c ssd1306.h eeprom.h font.h image.h CMakeLists.txt pico_sdk_import.cmake ./
+COPY main.c ssd1306.c ssd1306.h eeprom.h font.h image.h pulse_ts.pio CMakeLists.txt pico_sdk_import.cmake ./
 
-RUN mkdir build && cd build && cmake .. && make -j$(nproc)
+RUN mkdir build && cd build && cmake -DFW_BUILD_ID=${FW_BUILD_ID} .. && make -j$(nproc)
 
 FROM scratch
 COPY --from=build /src/build/main.uf2 /gc10next.uf2

@@ -40,7 +40,7 @@ inline static void swap(uint32_t *a, uint32_t *b) {
 }
 
 inline static void fancy_write(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, char *name) {
-    switch(i2c_write_blocking(i2c, addr, src, len, false)) {
+    switch(i2c_write_timeout_us(i2c, addr, src, len, false, 50000)) {
     case PICO_ERROR_GENERIC:
         printf("[%s] addr not acknowledged!\n", name);
         break;
@@ -189,7 +189,7 @@ void ssd1306_draw_char_with_font(ssd1306_t *p, uint32_t x, uint32_t y, uint32_t 
         uint8_t line=(uint8_t)(font[(c-0x20)*font[1]+i+2]);
 
         for(int8_t j=0; j<font[0]; ++j, line>>=1) {
-            if(line & 1 ==1)
+            if(line & 1)   // was `line & 1 == 1`, i.e. `line & (1==1)` by precedence
                 ssd1306_draw_square(p, x+i*scale, y+j*scale, scale, scale);
         }
     }
@@ -241,7 +241,7 @@ void ssd1306_bmp_show_image_with_offset(ssd1306_t *p, const uint8_t *data, const
         return;
 
     const int table_start=14+biSize;
-    uint8_t color_val;
+    uint8_t color_val = 0;   // palette scan below may not match
 
     for(uint8_t i=0; i<2; ++i) {
         if(!((data[table_start+i*4]<<16)|(data[table_start+i*4+1]<<8)|data[table_start+i*4+2])) {

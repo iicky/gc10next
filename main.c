@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
 #include "pico/binary_info.h"
@@ -19,44 +20,63 @@
 #include "hardware/sync.h"
 #include "hardware/i2c.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/clocks.h"
 #include "class/cdc/cdc_device.h"
 #include "ssd1306.h"
 #include "eeprom.h"
 #include "image.h"
+#include "pulse_ts.pio.h"
 
-#define FW_VERSION "FWNX1E01"
+// Firmware id. Upstream uses "FWNX1R<nn>" and this fork's main used
+// "FWNX1E01" -- both are `FWNX1` + one letter + two digits, so the letter
+// space is shared and any id of that shape could collide with a future
+// upstream release, or be mistaken for one. Use a shape upstream will not
+// emit, and carry the commit so a deployed board is traceable to source.
+// FW_BUILD_ID comes from git (or -DFW_BUILD_ID for the Docker build, which
+// has no .git). "E" is for entropy, this fork's purpose. Dropping the
+// release counter is deliberate: upstream emits sequence numbers, this
+// emits a commit, so the two can never be confused. 15 chars fits the
+// splash at x=30 (5px font + 1px gap, 98px from x=30).
+#ifndef FW_BUILD_ID
+#define FW_BUILD_ID "dev"
+#endif
+#define FW_VERSION "FWNX1E-" FW_BUILD_ID
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
 const uint LED_PIN = 25;
 const float conversion_factor = 3.3f / ( 1 << 12) * 3;
 
-static int tc = 0;
-uint32_t total_cnt;
-uint32_t ch1_cnt;
-uint32_t ch2_cnt;
+// Written by the detection IRQ, read elsewhere: must not be cached in registers.
+static volatile int tc = 0;
+volatile uint32_t total_cnt;
+volatile uint32_t ch1_cnt;
+volatile uint32_t ch2_cnt;
 
 static uint hvgPwmSlice;
 static uint bzsPwmSlice;
 
 uint16_t result;
 
-static bool df = false; // Detection Flag
+static volatile bool df = false; // Detection Flag
 
 bool isDual = false;
-bool is_sound_enabled = false;
+volatile bool is_sound_enabled = false;	// main loop/SerCmdExec write, detection IRQ reads
 bool is_button_pressed = false;
-bool sout = true;
-bool evt_mode = false;
+volatile bool sout = true;      // written by main loop, read by dispCPM in timer IRQ
+bool evt_mode = false;          // main loop only
 
-bool pd = false;
+volatile bool pd = false;		// main loop writes, timer IRQ reads and clears
 
 uint8_t cptr;
-uint8_t dispMode;
+volatile uint8_t dispMode;		// main loop writes, timer IRQ reads
 
-uint16_t gamma_sensitivity;
+volatile uint16_t gamma_sensitivity;	// SerCmdExec writes, timer IRQ reads
 uint16_t alarm_trigger_cpm;
 uint16_t hvg_pulsewidth;
 char CmdBuf[16];
@@ -65,7 +85,7 @@ uint32_t uptime;
 uint32_t cpm;
 uint32_t sma[4];
 uint16_t cbuf[20];
-uint16_t cpx;
+volatile uint16_t cpx;
 uint16_t lp;	// Long button press detection counter
 
 uint16_t cnt = 0;
@@ -93,6 +113,220 @@ void SerCmdProc(char ch);
 void SerCmdExec(void);
 void dispCPM(void);
 void prepareDisp(void);
+
+// ---------------------------------------------------------------------------
+// Hardware pulse timestamping (PIO + DMA)
+//
+// Two state machines run pulse_ts.pio, one per detection input, started in
+// sync so they share a single epoch. Each falling edge pushes a 32-bit
+// timebase snapshot; a DMA channel per SM moves those words into a ring
+// buffer. Nothing here needs the ARM core, so capture survives the 23 ms
+// OLED refresh, USB traffic, and any other interrupt work.
+// ---------------------------------------------------------------------------
+
+#define TS_CH_COUNT   2
+#define TS_RING_LOG2  10                       // 1024 entries per channel
+#define TS_RING_LEN   (1u << TS_RING_LOG2)
+#define TS_RING_BYTES (TS_RING_LEN * 4u)
+
+// The DMA write-address wrap requires the buffer to be aligned to its size.
+static uint32_t ts_ring[TS_CH_COUNT][TS_RING_LEN] __attribute__((aligned(TS_RING_BYTES)));
+
+static const uint ts_gpio[TS_CH_COUNT] = { 22, 2 };   // CH1 = GP22, CH2 = GP2
+static PIO       ts_pio = pio0;
+static int       ts_dma[TS_CH_COUNT]      = { -1, -1 };
+static uint64_t  ts_consumed[TS_CH_COUNT] = { 0, 0 };
+static uint32_t  ts_lost[TS_CH_COUNT]     = { 0, 0 };
+static uint32_t  ts_prev_x[TS_CH_COUNT]   = { 0, 0 };
+static uint64_t  ts_ticks[TS_CH_COUNT]    = { 0, 0 };
+static bool      ts_primed[TS_CH_COUNT]   = { false, false };
+static uint32_t  ts_per_us = 6;   // SM ticks per microsecond, set in ts_start
+static uint      ts_nch = 1;      // always 1: see the note in ts_start
+static bool      ts_running = false;
+// Output mode is one small scalar owned by SerCmdExec, which may run in
+// UART1_IRQ. The main loop reconciles sout/evt_mode from it. Independent
+// start/stop flags would race: a `stop` landing between the main loop's read
+// and its action would be lost, and a `go` would leave CPM lines interleaved
+// into a capture. Under the ARM EABI default (-fshort-enums) this compiles to
+// a single byte, written with one strb, so the IRQ cannot tear it.
+typedef enum { OUT_CPM = 0, OUT_QUIET, OUT_EVT } out_mode_t;
+static volatile out_mode_t out_req = OUT_CPM;
+
+// Work requested by interrupts and performed in the main loop.
+//
+// Nothing that can block belongs in an IRQ on this board. The OLED refresh is
+// a 1025-byte I2C blit that takes ~23 ms, and any printf can stall for up to
+// 500 ms waiting on USB plus 1000 ms on the stdio mutex. Running either from
+// the 1 Hz timer callback stalled every other interrupt behind it, which is
+// what made the detection interrupt miss counts in the first place. The timer
+// now only computes and raises a flag; the main loop does the slow part with
+// interrupts enabled, so the detector is never held off.
+static volatile bool     ui_refresh_req = false;   // redraw the measurement screen
+static volatile bool     cpm_out_pending = false;  // a CPM value is due on the wire
+static volatile uint32_t cpm_out_value = 0;
+static volatile uint32_t eeprom_err = 0;   // I2C failures, reported by `show`
+
+// Silent-reboot telemetry: CONSECUTIVE watchdog resets since power-on, not a
+// general reset count -- any non-watchdog reset (power cycle, BOOTSEL, DFU)
+// correctly clears it back to zero.
+// Watchdog scratch registers survive a watchdog reset
+// but are cleared by a power cycle, which is exactly the distinction worth
+// reporting: "has this board rebooted itself since it was plugged in?" Without
+// it, a watchdog recovery is invisible -- counters restart and the host sees a
+// healthy device, which is how the original lockup went unexplained. Scratch
+// 0..3 are free; the SDK uses 4..7 for its own reboot magic. A deliberate
+// `reboot` is tagged so only unexplained resets are counted. Note a fresh
+// picotool load can still show 1, since it reboots outside our control.
+static uint32_t wdt_reboots = 0;
+
+// UART receive ring. The interrupt stores bytes and does nothing else, so no
+// blocking work runs in interrupt context, but no input is dropped either:
+// polling alone would lose data, because the RX FIFO holds 32 bytes (2.8 ms at
+// 115200) while the main loop can be away for ~50 ms during a display redraw.
+// Single producer in the IRQ, single consumer in the loop, power-of-two size,
+// so it needs no locking on one core.
+#define URX_LEN 256u
+static volatile uint8_t  urx_buf[URX_LEN];
+static volatile uint16_t urx_head = 0, urx_tail = 0;
+
+static void on_uart_rx(void) {
+	while (uart_is_readable(uart1)) {
+		uint8_t ch = uart_getc(uart1);
+		uint16_t next = (urx_head + 1u) & (URX_LEN - 1u);
+		if (next != urx_tail) {          // full: drop, never block in an IRQ
+			urx_buf[urx_head] = ch;
+			urx_head = next;
+		}
+	}
+}
+
+// Total words the DMA has written since it was armed. transfer_count reads
+// back as the remaining count, and we arm with 0xFFFFFFFF.
+static uint32_t ts_produced(uint idx) {
+	return 0xFFFFFFFFu - dma_hw->ch[ts_dma[idx]].transfer_count;
+}
+
+static void ts_start(void) {
+	if (ts_running) {
+		// Re-entering evt: drop the backlog so capture starts at "now", and
+		// re-prime so the first event after the gap is consumed silently as a
+		// new anchor. ts_ticks does not advance while stopped, so the clock
+		// never jumps and the consumer's next delta is a real interarrival.
+		for (uint i = 0; i < ts_nch; i++) {
+			ts_consumed[i] = ts_produced(i);
+			ts_primed[i] = false;
+		}
+		return;
+	}
+
+	// evt captures CH1 only, including on the Dual. Two independent blockers,
+	// both of which must be solved together before ts_nch can become 2:
+	//
+	//  1. Ordering. ts_drain walks one ring to completion before starting the
+	//     next, so a second channel would emit all of CH1's batch and then all
+	//     of CH2's. Consumers take deltas across global line order, so
+	//     interleaved channels yield out-of-order and negative intervals. The
+	//     two rings must be merged by tick before output, using a cross-ring
+	//     watermark, since a sample may not have landed in one ring when the
+	//     other is snapshotted.
+	//  2. Epoch. Each channel anchors its own tick total on its own first
+	//     event, so even perfectly ordered output would mix two clocks.
+	//
+	// Either alone is insufficient. Shipping them half-done would feed
+	// meaningless intervals to /dev/random as if they were decay timings.
+	// The GPIO interrupt still counts CH2 for the display; only evt is CH1.
+	ts_nch = 1;
+	ts_per_us = clock_get_hz(clk_sys) / (1000000u * 8u);
+
+	uint offset = pio_add_program(ts_pio, &pulse_ts_program);
+	uint sm_mask = 0;
+
+	for (uint i = 0; i < ts_nch; i++) {
+		// Input only: do not claim the pad with pio_gpio_init, so the existing
+		// GPIO interrupt, pull-up, LED and buzzer behaviour keep working.
+		pio_sm_config c = pulse_ts_program_get_default_config(offset);
+		sm_config_set_jmp_pin(&c, ts_gpio[i]);
+		sm_config_set_clkdiv_int_frac(&c, 1, 0);
+
+		// Enter at 'recov' so a line already low at boot cannot fake an edge.
+		pio_sm_init(ts_pio, i, offset + pulse_ts_offset_recov, &c);
+		pio_sm_exec(ts_pio, i, pio_encode_mov_not(pio_x, pio_null));
+		sm_mask |= 1u << i;
+
+		int ch = dma_claim_unused_channel(true);
+		ts_dma[i] = ch;
+		dma_channel_config dc = dma_channel_get_default_config(ch);
+		channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+		channel_config_set_read_increment(&dc, false);
+		channel_config_set_write_increment(&dc, true);
+		channel_config_set_ring(&dc, true, TS_RING_LOG2 + 2);
+		channel_config_set_dreq(&dc, pio_get_dreq(ts_pio, i, false));
+		dma_channel_configure(ch, &dc, ts_ring[i], &ts_pio->rxf[i], 0xFFFFFFFFu, true);
+
+		ts_consumed[i] = 0;
+		ts_lost[i] = 0;
+	}
+
+	// Simultaneous start: both counters share an epoch from here on.
+	pio_enable_sm_mask_in_sync(ts_pio, sm_mask);
+	ts_running = true;
+}
+
+// Drain both rings to stdout. Runs in thread context, never in an interrupt.
+static void ts_drain(void) {
+	for (uint i = 0; i < ts_nch; i++) {
+		if (ts_dma[i] < 0) continue;
+
+		uint64_t produced = ts_produced(i);
+		uint64_t avail = produced - ts_consumed[i];
+
+		if (avail > TS_RING_LEN) {
+			// DMA lapped the ring. Resuming here would hand the consumer one
+			// fabricated interarrival spanning every lost event, because it
+			// derives intervals from consecutive lines and cannot see a
+			// comment marker. That is the same corruption this capture path
+			// exists to remove, so fail closed instead of emitting it.
+			// `evt` restarts the stream with a re-primed epoch.
+			uint32_t lost = (uint32_t)(avail - TS_RING_LEN);
+			ts_lost[i] += lost;
+			ts_consumed[i] = produced;
+			printf("# overrun ch%u lost=%lu - evt stopped\n",
+			       i + 1, (unsigned long)lost);
+			out_req = OUT_QUIET;
+			return;
+		}
+
+		while (avail--) {
+			uint32_t x = ts_ring[i][ts_consumed[i] & (TS_RING_LEN - 1)];
+			ts_consumed[i]++;
+
+			// X counts down. Modular subtraction accumulates into a 64-bit
+			// tick total, so the 715 s hardware wrap never reaches the wire
+			// and the reported clock is monotonic for the life of the boot.
+			//
+			// The priming sample is consumed silently. ts_ticks does not
+			// advance while capture is stopped, so anchoring on this event and
+			// printing from the next one means the consumer's first delta
+			// after a restart is a genuine interarrival, rather than a span
+			// covering the idle period or a degenerate zero.
+			if (!ts_primed[i]) {
+				ts_primed[i] = true;
+				ts_prev_x[i] = x;
+				continue;
+			}
+			ts_ticks[i] += (uint32_t)(ts_prev_x[i] - x);
+			ts_prev_x[i] = x;
+
+			// Wire format is exactly `E <microseconds> <channel>`, three
+			// tokens. The downstream entropy feeder parses positionally and
+			// rejects any line that is not exactly three fields, so this must
+			// not gain a resolution field without updating that consumer in
+			// lockstep. Capture itself stays at full 166.67 ns resolution.
+			printf("E %llu %u\n",
+			       (unsigned long long)(ts_ticks[i] / ts_per_us), i + 1);
+		}
+	}
+}
 
 bool __no_inline_not_in_flash_func(get_bootsel_button)() {
 	const uint CS_PIN_INDEX = 1;
@@ -133,15 +367,10 @@ void gpio_callback(uint gpio, uint32_t events) {
 			ch2_cnt++;
 		}
 
-		if (evt_mode) {
-			printf("E %llu %u\n", time_us_64(), gpio == 22 ? 1 : 2);
-		}
-	}
-}
-
-void on_uart_rx() {
-	while (uart_is_readable(uart1)) {
-		SerCmdProc(uart_getc(uart1));
+		// Event timestamps are captured by PIO + DMA, not here. Formatting
+		// them in this handler used to stall it for tens of microseconds and,
+		// because the GPIO edge latch is one sticky bit per pin, any edges
+		// arriving during the stall were merged away rather than queued.
 	}
 }
 
@@ -187,10 +416,10 @@ bool msecTimer_callback(repeating_timer_t *rt) {
 		}
 	}
 
-	if (pd == true) {
-		prepareDisp();
-		pd = false;
-	}
+	// prepareDisp blits the framebuffer over I2C, so it cannot run here. Leave
+	// pd set and let the main loop service it; the redraw is idempotent and
+	// coalescing repeats is correct, since prepareDisp reads dispMode fresh.
+	return true;
 }
 
 bool secTimer_callback(repeating_timer_t *rt) {
@@ -200,10 +429,16 @@ bool secTimer_callback(repeating_timer_t *rt) {
 	uptime++;	
 
 	if (sec_tmr % 3 == 0) {
-		cbuf[cbuf_idx++] = cpx;
+		// Read-and-clear must be atomic: the detection IRQ runs at a higher
+		// priority than this timer callback and increments cpx.
+		uint32_t irq_state = save_and_disable_interrupts();
+		uint16_t counts = cpx;
+		cpx = 0;
+		restore_interrupts(irq_state);
+
+		cbuf[cbuf_idx++] = counts;
 		if (cbuf_idx == 20) cbuf_idx = 0;
 
-		cpx = 0;
 		cpm = 0;
 		for (i = 0; i < 20; i++) cpm += cbuf[i];
 	}
@@ -229,7 +464,11 @@ bool secTimer_callback(repeating_timer_t *rt) {
 		sec_tmr = 0;
 	}
 
-	dispCPM();
+	// The screen refresh and the serial write both block for tens of ms. Only
+	// raise the request here; the main loop performs them.
+	ui_refresh_req = true;
+
+	return true;
 }
 
 long map(long x, long in_min, long in_max, long out_min, long out_max) {
@@ -237,7 +476,7 @@ long map(long x, long in_min, long in_max, long out_min, long out_max) {
 }
 
 void prepareDisp(void) {
-	char buf[12];
+	char buf[24];
 
 	if (dispMode == 0) {
 		ssd1306_clear(&disp);
@@ -350,7 +589,7 @@ void prepareDisp(void) {
 void dispCPM(void) {
 	uint8_t i, j;
 	uint32_t tmp;
-	char buf[12];
+	char buf[24];
 
 	sma[sma_idx++] = cpm;
 	if (sma_idx == 4) sma_idx = 0;
@@ -456,10 +695,10 @@ void dispCPM(void) {
 		ssd1306_draw_line(&disp, 98, 35, 102, 35);
 		ssd1306_draw_line(&disp, 98, 63, 102, 63);
 
-		sprintf(buf,  "%lu", cmax);
+		sprintf(buf,  "%d", (int)cmax);
 		ssd1306_draw_string(&disp, 104, 36, 1, buf);
 
-		sprintf(buf,  "%lu", cmin);
+		sprintf(buf,  "%d", (int)cmin);
 		ssd1306_draw_string(&disp, 104, 56, 1, buf);
 
 		ssd1306_show(&disp);
@@ -555,13 +794,22 @@ void dispCPM(void) {
 		ssd1306_show(&disp);
 	}
 
-	// CPM output
-	if (sout) {
-		printf("%d\n", tmp);
-	}
+	// The CPM value is handed to the main loop rather than written here.
+	// dispCPM is called from thread context now, but keeping the wire write
+	// out of this function means the display path and the serial path cannot
+	// stall each other.
+	cpm_out_value = tmp;
+	cpm_out_pending = true;
 }
 
+// The `reboot` command goes through the watchdog, so tag it or it would look
+// like a fault. This only covers reboots we initiate: an external picotool
+// reflash resets the chip outside our control and will still show up as one
+// unexplained reset. Unplugging clears it.
+#define WDT_INTENTIONAL 0x5245424fu   // 'REBO'
+
 void software_reset() {
+	watchdog_hw->scratch[1] = WDT_INTENTIONAL;
 	watchdog_enable(1, 1);
 	while(1);
 }
@@ -573,16 +821,10 @@ void eeprom_write_byte (uint16_t addr, uint8_t val) {
 	src[0] = addr & 0xFF;
 	src[1] = val;
 
-	switch(i2c_write_blocking(i2c_default, 0x50, src, 2, false)) {
-		case PICO_ERROR_GENERIC:
-			printf("[%s] addr not acknowledged!\n");
-			 break;
-		case PICO_ERROR_TIMEOUT:
-			printf("[%s] timeout!\n");
-			break;
-		default:
-			break;
-	}
+	// No printf here: this runs with interrupts disabled, and the original
+	// calls passed no argument for %s, so any bus error dereferenced a junk
+	// pointer. Count the failure and let the main loop report it.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 2, false, 10000) < 0) eeprom_err++;
 	restore_interrupts(flags);
 
 	sleep_ms(5);
@@ -596,16 +838,10 @@ void eeprom_write_word (uint16_t addr, uint16_t val) {
 	src[1] = val  & 0xFF;
 	src[2] = val >> 8;
 
-	switch(i2c_write_blocking(i2c_default, 0x50, src, 3, false)) {
-		case PICO_ERROR_GENERIC:
-			printf("[%s] addr not acknowledged!\n");
-			 break;
-		case PICO_ERROR_TIMEOUT:
-			printf("[%s] timeout!\n");
-			break;
-		default:
-			break;
-	}
+	// No printf here: this runs with interrupts disabled, and the original
+	// calls passed no argument for %s, so any bus error dereferenced a junk
+	// pointer. Count the failure and let the main loop report it.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 3, false, 10000) < 0) eeprom_err++;
 	restore_interrupts(flags);
 
 	sleep_ms(5);
@@ -621,16 +857,10 @@ void eeprom_write_long (uint16_t addr, uint32_t val) {
 	src[3] = (val >> 16) & 0xFF;
 	src[4] = (val >> 24) & 0xFF;
 
-	switch(i2c_write_blocking(i2c_default, 0x50, src, 5, false)) {
-		case PICO_ERROR_GENERIC:
-			printf("[%s] addr not acknowledged!\n");
-			 break;
-		case PICO_ERROR_TIMEOUT:
-			printf("[%s] timeout!\n");
-			break;
-		default:
-			break;
-	}
+	// No printf here: this runs with interrupts disabled, and the original
+	// calls passed no argument for %s, so any bus error dereferenced a junk
+	// pointer. Count the failure and let the main loop report it.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 5, false, 10000) < 0) eeprom_err++;
 	restore_interrupts(flags);
 
 	sleep_ms(5);
@@ -645,13 +875,13 @@ int eeprom_read_byte(int addr, uint8_t *p)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
     }
 
-    ret = i2c_read_blocking(i2c_default, 0x50, &rx, 1, false);
+    ret = i2c_read_timeout_us(i2c_default, 0x50, &rx, 1, false, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
@@ -673,13 +903,13 @@ int eeprom_read_word(int addr, uint16_t *p)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
     }
 
-    ret = i2c_read_blocking(i2c_default, 0x50, rx, 2, false);
+    ret = i2c_read_timeout_us(i2c_default, 0x50, rx, 2, false, 10000);
     if (ret != 2) {
 		restore_interrupts(flags);
 		return ret;
@@ -701,13 +931,13 @@ int eeprom_read_long(int addr, uint32_t *p)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
     }
 
-    ret = i2c_read_blocking(i2c_default, 0x50, rx, 4, false);
+    ret = i2c_read_timeout_us(i2c_default, 0x50, rx, 4, false, 10000);
     if (ret != 4) {
 		restore_interrupts(flags);
 		return ret;
@@ -729,14 +959,14 @@ int eeprom_read_page(int addr, uint8_t *p, size_t len)
 
 	src = (uint8_t)addr;
 
-	ret = i2c_write_blocking(i2c_default, 0x50, &src, 1, true);
+	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
 	if (ret != 1) {
 		restore_interrupts(flags);
 		return ret;
 	}
 
-	ret = i2c_read_blocking(i2c_default, 0x50, rx, len, false);
-	if (ret != len) {
+	ret = i2c_read_timeout_us(i2c_default, 0x50, rx, len, false, 10000);
+	if (ret < 0 || (size_t)ret != len) {
 		restore_interrupts(flags);
 		return ret;
 	}
@@ -750,19 +980,18 @@ int eeprom_read_page(int addr, uint8_t *p, size_t len)
 
 void SerCmdExec(void) {
 	char* ptr;
-	char buf[8];
+	char buf[24];
 
 	if (memcmp((char*)CmdBuf, "stop", 4) == 0) {
-		sout = false;
-		evt_mode = false;
+		// Last command wins: one strb, no read-modify-write. The main loop
+		// owns sout/evt_mode and all PIO/DMA work, which must not run here.
+		out_req = OUT_QUIET;
 	} else
 	if (memcmp((char*)CmdBuf, "go", 2) == 0) {
-		sout = true;
-		evt_mode = false;
+		out_req = OUT_CPM;
 	} else
 	if (memcmp((char*)CmdBuf, "evt", 3) == 0) {
-		sout = false;
-		evt_mode = true;
+		out_req = OUT_EVT;
 	} else
 	if (memcmp((char*)CmdBuf, "set ", 4) == 0) {
 		ptr = (char*)CmdBuf + 4;
@@ -816,25 +1045,14 @@ void SerCmdExec(void) {
 		eeprom_write_byte(OFS_SOUND, (is_sound_enabled == true)? 1 : 0);
 	} else
 	if (memcmp((char*)CmdBuf, "show", 4) == 0) {
-		printf("ttc: ");
-		sprintf(buf, "%lu", total_cnt);
-		printf(buf);
-		printf("\r\n");
-
-		printf("gms: ");
-		sprintf(buf, "%u", gamma_sensitivity);
-		printf(buf);
-		printf("\r\n");
-
-		printf("atc: ");
-		sprintf(buf, "%u", alarm_trigger_cpm);
-		printf(buf);
-		printf("\r\n");
-
-		printf("hvg: ");
-		sprintf(buf, "%u", hvg_pulsewidth);
-		printf(buf);
-		printf("\r\n");
+		printf("ttc: %lu\r\n", (unsigned long)total_cnt);
+		printf("gms: %u\r\n", gamma_sensitivity);
+		printf("atc: %u\r\n", alarm_trigger_cpm);
+		printf("hvg: %u\r\n", hvg_pulsewidth);
+		printf("tsl: %lu %lu\r\n", (unsigned long)ts_lost[0], (unsigned long)ts_lost[1]);
+		printf("eer: %lu\r\n", (unsigned long)eeprom_err);
+		printf("ots: %lu\r\n", (unsigned long)uptime);
+		printf("wdt: %lu\r\n", (unsigned long)wdt_reboots);
 	} else
 	if (memcmp((char*)CmdBuf, "reboot", 6) == 0) {
 		software_reset();
@@ -851,18 +1069,17 @@ void SerCmdExec(void) {
 		reset_usb_boot(0, 0);
 	} else
 	if (memcmp((char*)CmdBuf, "ver", 3) == 0) {
-		uint8_t pmn[8];
+		uint8_t pmn[8 + 1];   // room for a terminator: the field may fill all 8
+		memset(pmn, 0, sizeof(pmn));
 		uint8_t rev[2];
 
-		eeprom_read_page(OFS_MODELNAME, pmn, 8);
+		eeprom_read_page(OFS_MODELNAME, pmn, 8);   // pmn[8] stays NUL
 		eeprom_read_word(OFS_BDREV, (uint16_t*)rev);
 
 		printf("%s\n", pmn);
 		printf("%02X%02X\n", rev[1],rev[0]);
 
-		sprintf(buf, "%s", FW_VERSION);
-		printf(buf);
-		printf("\r\n");
+		printf("%s\r\n", FW_VERSION);
 	}
 }
 
@@ -1036,7 +1253,24 @@ int main() {
 
 	set_sys_clock_48mhz();
 
+	if (!watchdog_caused_reboot()) {
+		wdt_reboots = 0;                       // power-on clears the history
+	} else if (watchdog_hw->scratch[1] == WDT_INTENTIONAL) {
+		wdt_reboots = watchdog_hw->scratch[0]; // `reboot`/reflash: not a fault
+	} else {
+		wdt_reboots = watchdog_hw->scratch[0] + 1;
+	}
+	watchdog_hw->scratch[0] = wdt_reboots;
+	watchdog_hw->scratch[1] = 0;
+
 	stdio_init_all();
+
+	// Armed before any I2C. The EEPROM and OLED helpers block, and the EEPROM
+	// ones do so with interrupts disabled, so a stuck bus during init would hang
+	// forever with no way back except physically holding BOOTSEL. The window is
+	// generous because init legitimately takes a while; the main loop tightens
+	// it to 3 s once running.
+	watchdog_enable(8000, 1);
 
 	// Futer Use (battery)
 	adc_init();
@@ -1052,7 +1286,9 @@ int main() {
 	gpio_pull_up(21);
 	bi_decl(bi_2pins_with_func(20, 21, GPIO_FUNC_I2C));
 
-	// UART
+	// UART. The RX interrupt only fills urx_buf; commands are parsed in the main
+	// loop, so the printf echo stays out of interrupt context and both transports
+	// feed one parser instead of racing on CmdBuf.
 	//uart_set_baudrate(uart1, 9600);
 	irq_set_exclusive_handler(UART1_IRQ, on_uart_rx);
 	irq_set_enabled(UART1_IRQ, true);
@@ -1068,12 +1304,18 @@ int main() {
 	disp.external_vcc = false;
 	ssd1306_init(&disp, 128, 64, 0x3C, i2c1);
 
+	watchdog_update();
+	// eeprom_read_page fills exactly 8 bytes and guarantees no terminator, so a
+	// string compare could run off the end if the field is corrupt or padded.
+	// Compare a fixed length instead, and require the field to end there.
 	uint8_t mn[8];
-	eeprom_read_page(OFS_MODELNAME, mn, 8);
-	if (strcmp(mn, "GC10nxd") == 0) {
+	memset(mn, 0, sizeof(mn));
+	eeprom_read_page(OFS_MODELNAME, mn, sizeof(mn));
+	if (memcmp(mn, "GC10nxd", 7) == 0 && (mn[7] == '\0' || mn[7] == 0xFF)) {
 		isDual = true;
 	}
 
+	watchdog_update();
 	title();
 
 	uint8_t soundMode;
@@ -1114,21 +1356,49 @@ int main() {
 	gpio_set_dir(2, GPIO_IN);
 	gpio_pull_up(2);
 
-	gpio_set_irq_enabled(2, GPIO_IRQ_EDGE_FALL, true);
+	// Only the Dual has a tube on CH2. On a single-tube board GP2 is an
+	// unconnected header pin held by a weak internal pull-up, so enabling its
+	// edge interrupt just invites noise into the count.
+	if (isDual) {
+		gpio_set_irq_enabled(2, GPIO_IRQ_EDGE_FALL, true);
+	}
 
+	// No interrupt priority juggling. The 1 Hz callback used to blit the whole
+	// OLED framebuffer over I2C from inside the timer interrupt, blocking the
+	// detection interrupt for ~23 ms and losing every edge but one in that
+	// window. That work now runs in the main loop, so the alarm interrupt is
+	// short and the detector needs no special priority to be serviced.
 	add_repeating_timer_ms(-1, &msecTimer_callback, NULL, &msecTimer);
 	add_repeating_timer_ms(-1000, &secTimer_callback, NULL, &secTimer);
 
 	// LOAD EEPROM
-	eeprom_read_word(OFS_GMS, &gamma_sensitivity);
-	eeprom_read_word(OFS_ALARM, &alarm_trigger_cpm);
-	eeprom_read_byte(OFS_DISPMODE, &dispMode);
+	// Stage through plain locals: these globals are volatile because IRQs read
+	// them, and eeprom_read_* takes a non-volatile pointer.
+	//
+	// Seed each local from its global. eeprom_read_* returns without writing
+	// through the pointer when the I2C transfer fails, so an uninitialised
+	// local would leave stack garbage in the global. dispMode in particular
+	// must stay within MODEMAX: dispCPM tests it against each mode in turn and
+	// draws nothing at all if none match, freezing the display.
+	uint16_t gms_init = gamma_sensitivity;
+	uint16_t alarm_init = alarm_trigger_cpm;
+	uint8_t  dispmode_init = dispMode;
+	eeprom_read_word(OFS_GMS, &gms_init);
+	eeprom_read_word(OFS_ALARM, &alarm_init);
+	eeprom_read_byte(OFS_DISPMODE, &dispmode_init);
+	gamma_sensitivity = gms_init;
+	alarm_trigger_cpm = alarm_init;
+	dispMode = (dispmode_init > MODEMAX) ? 0 : dispmode_init;
 
 	cmax = 0;
 	cptr = 0;
 	uptime = 0;
 
 	int c;
+
+	// Tighten the window now that init is done. The loop period is 25 ms plus a
+	// display blit, so 3 s is far more headroom than any iteration needs.
+	watchdog_enable(3000, 1);
 
 	while(1) {
 
@@ -1164,11 +1434,55 @@ int main() {
 
 		sleep_ms(25);
 
+		// Reconcile output mode from one snapshot of the requested state, so a
+		// command arriving mid-reconcile is applied whole on the next pass
+		// rather than half-applied now. Converges within one loop iteration.
+		out_mode_t want = out_req;
+
+		if (want == OUT_EVT && !evt_mode) {
+			// No banner: the downstream consumer rejects any line that is not
+			// exactly three whitespace-separated tokens, so a header would be
+			// dead weight at best. The wire format is unchanged from v1.
+			ts_start();
+		}
+
+		sout     = (want == OUT_CPM);
+		evt_mode = (want == OUT_EVT);
+		// Deferred display work. Both calls blit the framebuffer over I2C and
+		// block for ~23 ms, so they run here with interrupts enabled rather
+		// than inside the timer callback that used to invoke them.
+		if (pd) {
+			pd = false;
+			prepareDisp();
+		}
+		if (ui_refresh_req) {
+			ui_refresh_req = false;
+			dispCPM();
+		}
+		if (cpm_out_pending) {
+			cpm_out_pending = false;
+			if (sout) printf("%lu\n", (unsigned long)cpm_out_value);
+		}
+
+		if (evt_mode) {
+			ts_drain();
+		}
+
+		// Commands from both transports are parsed here, in thread context.
+		// Previously UART bytes were parsed inside UART1_IRQ, which put printf
+		// in an interrupt and let two transports write CmdBuf concurrently.
+		while (urx_tail != urx_head) {
+			uint8_t ch = urx_buf[urx_tail];
+			urx_tail = (urx_tail + 1u) & (URX_LEN - 1u);
+			SerCmdProc(ch);
+		}
 		if (tud_cdc_connected()) {
 			while ((c = tud_cdc_read_char()) != -1) {
 				SerCmdProc(c);
 			}
 		}
+
+		watchdog_update();
 	}
 
 	return 0;
