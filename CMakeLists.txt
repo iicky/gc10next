@@ -12,12 +12,13 @@ pico_sdk_init()
 # add_executable() to apply to the target.
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
-# Commit id for the firmware version string. Derived from git when building
-# from a checkout. The Docker build has no .git and must pass -DFW_BUILD_ID
-# explicitly; it refuses to build without it, so a container image can never
-# be labelled with a commit it was not built from. A trailing '+' means the
-# tree had uncommitted changes, so the hash alone would not describe what is
-# actually running.
+# Commit id for the firmware version string. In a checkout it is read straight
+# from git, so it is self-verifying. The Docker build has no .git and verifies
+# nothing: it only forces the caller to supply an id rather than defaulting to
+# "dev". Whether that id describes the copied source is the caller's
+# responsibility, and a wrong value still yields a wrongly labelled image.
+# A trailing '+' means the tree had uncommitted changes, so the hash alone
+# would not describe what is actually running.
 #
 # An empty -DFW_BUILD_ID counts as unset: passing one through an undefined
 # shell variable defines the cache entry as "", which would otherwise skip
