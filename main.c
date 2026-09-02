@@ -1065,15 +1065,31 @@ void SerCmdExec(void) {
 	char* ptr;
 	char buf[24];
 
-	if (memcmp((char*)CmdBuf, "stop", 4) == 0) {
+	// Match commands exactly, not by prefix. The fixed-length memcmp this
+	// replaced also accepted any longer line that merely started with a
+	// command, so `saved` ran `save`, `reboots` rebooted, `version` printed
+	// `ver`, and -- worse -- a garbage line beginning "dfu" arriving on the
+	// UART RX pin dropped the board into the USB bootloader (reset_usb_boot),
+	// taking a deployed instrument offline until a physical reflash. Note the
+	// hazard is trailing junk, not near-misses: `factory` never matched
+	// `factry`, since the two differ at the fifth character.
+	// CmdBuf is NUL-terminated
+	// on every path that reaches here (SerCmdProc writes CmdBuf[cptr]=0 on CR,
+	// and the over-length branch resets without dispatching), so strcmp is
+	// safe and requires the command to end exactly where it should.
+	//
+	// `set ` stays a prefix match: it alone carries a key=value tail. With
+	// exact matching everywhere else the dispatch order no longer matters, so
+	// a plain strcmp chain says all there is to say without a table.
+	if (strcmp((char*)CmdBuf, "stop") == 0) {
 		// Last command wins: one strb, no read-modify-write. The main loop
 		// owns sout/evt_mode and all PIO/DMA work, which must not run here.
 		out_req = OUT_QUIET;
 	} else
-	if (memcmp((char*)CmdBuf, "go", 2) == 0) {
+	if (strcmp((char*)CmdBuf, "go") == 0) {
 		out_req = OUT_CPM;
 	} else
-	if (memcmp((char*)CmdBuf, "evt", 3) == 0) {
+	if (strcmp((char*)CmdBuf, "evt") == 0) {
 		out_req = OUT_EVT;
 	} else
 	if (memcmp((char*)CmdBuf, "set ", 4) == 0) {
@@ -1134,28 +1150,31 @@ void SerCmdExec(void) {
 		} else
 		if (memcmp(ptr, "snd=", 4) == 0) {
 			ptr += 4;
-			if (memcmp(ptr, "on", 2) == 0) {
+			// Exact on/off only: the old memcmp(ptr,"on",2) also accepted
+			// `snd=onx` and silently enabled sound. An unrecognised value is
+			// left to fall through and do nothing, as before.
+			if (strcmp(ptr, "on") == 0) {
 				is_sound_enabled = true;
 			} else
-			if (memcmp(ptr, "off", 3) == 0) {
+			if (strcmp(ptr, "off") == 0) {
 				is_sound_enabled = false;
 			}
 		} else
 		if (memcmp(ptr, "dpd=", 4) == 0) {
 			ptr += 4;
-			if (memcmp(ptr, "on", 2) == 0) {
+			if (strcmp(ptr, "on") == 0) {
 				ssd1306_poweron(&disp);
 			} else
-			if (memcmp(ptr, "off", 3) == 0) {
+			if (strcmp(ptr, "off") == 0) {
 				ssd1306_poweroff(&disp);
 			}
 		} else
 		if (memcmp(ptr, "nsg=", 4) == 0) {
 			ptr += 4;
-			if (memcmp(ptr, "on", 2) == 0) {
+			if (strcmp(ptr, "on") == 0) {
 				nsg_enabled = true;
 			} else
-			if (memcmp(ptr, "off", 3) == 0) {
+			if (strcmp(ptr, "off") == 0) {
 				nsg_enabled = false;
 				nsg_flag = false;
 			}
@@ -1172,7 +1191,7 @@ void SerCmdExec(void) {
 			}
 		}
 	} else
-	if (memcmp((char*)CmdBuf, "save", 4) == 0) {
+	if (strcmp((char*)CmdBuf, "save") == 0) {
 		eeprom_write_word(OFS_GMS, gamma_sensitivity);
 		eeprom_write_word(OFS_ALARM, alarm_trigger_cpm);
 		// Never write the parked placeholder back: that would bake it into
@@ -1185,7 +1204,7 @@ void SerCmdExec(void) {
 		// nothing ever wrote it, so the choice was lost on every power cycle.
 		eeprom_write_byte(OFS_DISPMODE, dispMode);
 	} else
-	if (memcmp((char*)CmdBuf, "show", 4) == 0) {
+	if (strcmp((char*)CmdBuf, "show") == 0) {
 		printf("ttc: %lu\r\n", (unsigned long)total_cnt);
 		printf("gms: %u\r\n", gamma_sensitivity);
 		printf("atc: %u\r\n", alarm_trigger_cpm);
@@ -1213,10 +1232,10 @@ void SerCmdExec(void) {
 		printf("ots: %lu\r\n", (unsigned long)uptime);
 		printf("wdt: %lu\r\n", (unsigned long)wdt_reboots);
 	} else
-	if (memcmp((char*)CmdBuf, "reboot", 6) == 0) {
+	if (strcmp((char*)CmdBuf, "reboot") == 0) {
 		software_reset();
 	} else
-	if (memcmp((char*)CmdBuf, "factry", 6) == 0) {
+	if (strcmp((char*)CmdBuf, "factry") == 0) {
 		// Operator preferences only.
 		//
 		// gms and hvg are per-board calibration: gms is this tube's
@@ -1247,7 +1266,7 @@ void SerCmdExec(void) {
 		printf("kept: gms=%u hvg=%u (per-board calibration)\r\n",
 		       gamma_sensitivity, hvg_pulsewidth);
 	} else
-	if (memcmp((char*)CmdBuf, "dfu", 3) == 0) {
+	if (strcmp((char*)CmdBuf, "dfu") == 0) {
 		ssd1306_clear(&disp);
 		sprintf(buf, "DFU MODE");
 		ssd1306_draw_string(&disp, 0, 0, 2, buf);
@@ -1255,7 +1274,7 @@ void SerCmdExec(void) {
 
 		reset_usb_boot(0, 0);
 	} else
-	if (memcmp((char*)CmdBuf, "ver", 3) == 0) {
+	if (strcmp((char*)CmdBuf, "ver") == 0) {
 		uint8_t pmn[8 + 1];   // room for a terminator: the field may fill all 8
 		memset(pmn, 0, sizeof(pmn));
 		uint8_t rev[2];
