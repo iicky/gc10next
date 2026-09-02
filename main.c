@@ -1194,6 +1194,9 @@ void SerCmdExec(void) {
 		// calibration.
 		printf("hvs: %u\r\n", hvg_trusted ? 1u : 0u);
 		printf("dsp: %u\r\n", (unsigned)dispMode);
+		// Every other persisted setting was reportable and this one was not,
+		// so the mute state could only be confirmed by listening to it.
+		printf("snd: %u\r\n", is_sound_enabled ? 1u : 0u);
 		printf("alm: %u\r\n", alarm_on ? 1u : 0u);
 		// enabled, length of the current silent run, window it is judged against
 		printf("nsg: %u %lu %lu\r\n", nsg_enabled ? 1u : 0u,
