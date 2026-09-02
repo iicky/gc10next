@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
 #include "pico/binary_info.h"
@@ -30,7 +31,7 @@
 #include "image.h"
 #include "pulse_ts.pio.h"
 
-#define FW_VERSION "FWNX1H02"
+#define FW_VERSION "FWNX1H03"
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
@@ -931,7 +932,7 @@ int eeprom_read_page(int addr, uint8_t *p, size_t len)
 	}
 
 	ret = i2c_read_timeout_us(i2c_default, 0x50, rx, len, false, 10000);
-	if (ret != len) {
+	if (ret < 0 || (size_t)ret != len) {
 		restore_interrupts(flags);
 		return ret;
 	}
@@ -1032,10 +1033,11 @@ void SerCmdExec(void) {
 		reset_usb_boot(0, 0);
 	} else
 	if (memcmp((char*)CmdBuf, "ver", 3) == 0) {
-		uint8_t pmn[8];
+		uint8_t pmn[8 + 1];   // room for a terminator: the field may fill all 8
+		memset(pmn, 0, sizeof(pmn));
 		uint8_t rev[2];
 
-		eeprom_read_page(OFS_MODELNAME, pmn, 8);
+		eeprom_read_page(OFS_MODELNAME, pmn, 8);   // pmn[8] stays NUL
 		eeprom_read_word(OFS_BDREV, (uint16_t*)rev);
 
 		printf("%s\n", pmn);
@@ -1257,9 +1259,13 @@ int main() {
 	ssd1306_init(&disp, 128, 64, 0x3C, i2c1);
 
 	watchdog_update();
+	// eeprom_read_page fills exactly 8 bytes and guarantees no terminator, so a
+	// string compare could run off the end if the field is corrupt or padded.
+	// Compare a fixed length instead, and require the field to end there.
 	uint8_t mn[8];
-	eeprom_read_page(OFS_MODELNAME, mn, 8);
-	if (strcmp((const char *)mn, "GC10nxd") == 0) {
+	memset(mn, 0, sizeof(mn));
+	eeprom_read_page(OFS_MODELNAME, mn, sizeof(mn));
+	if (memcmp(mn, "GC10nxd", 7) == 0 && (mn[7] == '\0' || mn[7] == 0xFF)) {
 		isDual = true;
 	}
 
