@@ -7,6 +7,11 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
+# The original build enabled no warnings at all, which is how a printf with a
+# %s and no argument survived in the EEPROM error path. Must precede
+# add_executable() to apply to the target.
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
 add_executable(main
 	main.c ssd1306.c
 	)
