@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
 #include "pico/binary_info.h"
@@ -68,7 +69,7 @@ static volatile bool df = false; // Detection Flag
 bool isDual = false;
 volatile bool is_sound_enabled = false;	// main loop/SerCmdExec write, detection IRQ reads
 bool is_button_pressed = false;
-volatile bool sout = true;      // written by main loop, read by dispCPM in timer IRQ
+volatile bool sout = true;      // main loop only, since the CPM write moved there
 bool evt_mode = false;          // main loop only
 
 volatile bool pd = false;		// main loop writes, timer IRQ reads and clears
@@ -79,6 +80,9 @@ volatile uint8_t dispMode;		// main loop writes, timer IRQ reads
 volatile uint16_t gamma_sensitivity;	// SerCmdExec writes, timer IRQ reads
 uint16_t alarm_trigger_cpm;
 uint16_t hvg_pulsewidth;
+// False when the stored HV pulse width was missing, erased or out of range,
+// so the generator is parked rather than driven at a guessed bias.
+bool hvg_trusted = true;
 char CmdBuf[16];
 
 uint32_t uptime;
@@ -109,10 +113,75 @@ int16_t cmin;
 
 ssd1306_t disp;
 
+// ---------------------------------------------------------------------------
+// Alarm
+//
+// atc was settable, saved, loaded and reported by `show`, but never compared
+// against anything, so the threshold could be configured and could not fire.
+// Hysteresis matters here because the reading is a 60 s window over Poisson
+// counts: a bare threshold test chatters on and off around the setpoint.
+// Clearing at 90% of the trigger costs nothing and makes the state stable.
+// ---------------------------------------------------------------------------
+static volatile bool alarm_on = false;
+
+// ---------------------------------------------------------------------------
+// No-signal supervision
+//
+// A dead tube or a failed HV supply reads as a confident 0 CPM, which is
+// indistinguishable from "all clear" on the display -- the dangerous failure
+// mode for an unattended instrument. Silence is evidence of a fault only in
+// proportion to the count rate the detector normally sees, so the window is
+// derived rather than fixed:
+//
+//     P(no counts in T) = exp(-lambda*T)   ->   T = ln(1/p) / lambda
+//
+// At a 25 CPM background a 30 s silence is already a one-in-a-million event.
+// Shield the tube down to 1 CPM and the same 30 s window would cry failure
+// roughly twice a day on perfectly good hardware, so it stretches to ~14 min
+// instead. lambda is measured from this boot's own counts, biased low by two
+// sigma so it is a lower bound rather than a best guess: underestimating the
+// rate lengthens the window, which is the harmless direction.
+//
+// Deliberately NOT an input: the persisted baseline. A stored rate cannot be
+// known to describe the environment the board woke up in, and if it is too
+// high the window comes out too short, which is the direction that fabricates
+// failure reports. It is kept as operator context only.
+//
+// The cost of that choice is honest: a board that powers up already dead has
+// no observations to reason from, so it sits at the one-hour ceiling before
+// saying anything. Waiting an hour to report a fault beats reporting one that
+// is not there.
+//
+// The threshold stays at genuine zero and is never scaled off a baseline.
+// Scaling it would fire every time the counter is moved off a source, which
+// is normal use, not a fault.
+//
+// This is reported as a diagnostic, not a verdict: with no HV sense the
+// firmware cannot tell a dead tube from a lead box, so it says "implausibly
+// quiet", and the operator decides.
+// ---------------------------------------------------------------------------
+#define NSG_P_EXP        6u      // target false-positive rate, 1e-6
+#define NSG_WIN_MIN_S    30u     // never claim a fault faster than this
+#define NSG_WIN_MAX_S    3600u   // nor take longer than an hour
+
+static bool     nsg_enabled = true;
+static volatile bool     nsg_flag = false;
+static volatile uint32_t silent_secs = 0;
+static volatile uint32_t nsg_window_s = NSG_WIN_MAX_S;
+static uint32_t last_seen_cnt = 0;
+
+// Observed background floor, in tenths of a CPM so the 2-byte EEPROM slot
+// keeps 0.1 CPM resolution up to 6553 CPM. Diagnostic context for the
+// operator -- "this is what the board used to see" -- and explicitly not a
+// threshold input; see the note above.
+static uint16_t baseline_x10 = 0;
+static uint16_t baseline_saved_x10 = 0;
+static volatile bool baseline_save_req = false;
+
 void SerCmdProc(char ch);
 void SerCmdExec(void);
-void dispCPM(void);
-void prepareDisp(void);
+void sampleDisplay(void);
+void drawScreen(void);
 
 // ---------------------------------------------------------------------------
 // Hardware pulse timestamping (PIO + DMA)
@@ -352,7 +421,11 @@ bool __no_inline_not_in_flash_func(get_bootsel_button)() {
 void gpio_callback(uint gpio, uint32_t events) {
 	if (events & 0x04) {
 		gpio_put(LED_PIN, 1);
-		if (is_sound_enabled) {
+		// The alarm owns the buzzer outright while it holds: a click landing
+		// mid-alarm would drop the tone to click level, and the clear in
+		// msecTimer_callback is barred during an alarm, so it would stay
+		// there. One volatile byte read to keep the two paths disjoint.
+		if (is_sound_enabled && !alarm_on) {
 			pwm_set_chan_level(bzsPwmSlice, PWM_CHAN_A, 1000/3);
 		}
 
@@ -412,13 +485,17 @@ bool msecTimer_callback(repeating_timer_t *rt) {
 			df = false;
 			tc = 0;
 			gpio_put(LED_PIN, 0);
-			pwm_set_chan_level(bzsPwmSlice, PWM_CHAN_A, 0);
+			// The alarm owns the buzzer while it is active, so the per-count
+			// click must not switch it back off mid-alarm.
+			if (!alarm_on) {
+				pwm_set_chan_level(bzsPwmSlice, PWM_CHAN_A, 0);
+			}
 		}
 	}
 
-	// prepareDisp blits the framebuffer over I2C, so it cannot run here. Leave
+	// drawScreen blits the framebuffer over I2C, so it cannot run here. Leave
 	// pd set and let the main loop service it; the redraw is idempotent and
-	// coalescing repeats is correct, since prepareDisp reads dispMode fresh.
+	// coalescing repeats is correct, since drawScreen reads dispMode fresh.
 	return true;
 }
 
@@ -458,6 +535,116 @@ bool secTimer_callback(repeating_timer_t *rt) {
 
 		if (avrg < min_avrg)
 			min_avrg = avrg;
+
+		// Persist the learned floor, but only when it has moved materially
+		// and only via the main loop. eeprom_write_word holds interrupts off
+		// for up to 10 ms, which at these rates loses a count, and avrg
+		// updates every second -- writing as it learns would both drop counts
+		// continuously and wear the part out in days. A 25% deadband plus
+		// min_avrg being monotonic within a boot means this settles to a
+		// handful of writes for the life of the board.
+		uint16_t want = (uint16_t)(min_avrg * 10.0f + 0.5f);
+		uint16_t ref  = baseline_saved_x10;
+		if (want != ref && (want < (ref - ref / 4) || want > (ref + ref / 4))) {
+			baseline_x10 = want;
+			baseline_save_req = true;
+		}
+	}
+
+	// Alarm, with hysteresis so it cannot chatter around the setpoint.
+	// atc == 0 disables it, which is the shipped default.
+	if (alarm_trigger_cpm > 0) {
+		if (!alarm_on && cpm >= alarm_trigger_cpm) {
+			alarm_on = true;
+		} else if (alarm_on && cpm < (uint32_t)alarm_trigger_cpm * 9u / 10u) {
+			alarm_on = false;
+		}
+	} else {
+		alarm_on = false;
+	}
+
+	// Drive the buzzer on level changes only.
+	//
+	// The clear has to happen here and not lean on the per-count click path
+	// to undo it. While the alarm holds, msecTimer_callback is barred from
+	// switching the buzzer off, and that clear only runs after a count sets
+	// df -- so if the alarm ends because counts stopped, no further click
+	// would ever run and the tone would latch on forever. That is exactly
+	// the case the no-signal supervision below exists to catch, which would
+	// have made a dead tube sound like a screaming alarm.
+	//
+	// Comparing the wanted level rather than the alarm flag also covers
+	// `set snd=off` arriving mid-alarm, where the flag never changes.
+	{
+		static uint16_t alarm_level_prev = 0;
+		uint16_t want = (alarm_on && is_sound_enabled) ? (1000u / 2u) : 0u;
+		if (want != alarm_level_prev) {
+			pwm_set_chan_level(bzsPwmSlice, PWM_CHAN_A, want);
+			alarm_level_prev = want;
+		}
+	}
+
+	// Silence supervision. Any count at all resets the run, so this measures
+	// the current gap rather than a rate.
+	if (total_cnt != last_seen_cnt) {
+		last_seen_cnt = total_cnt;
+		silent_secs = 0;
+		nsg_flag = false;
+	} else {
+		silent_secs++;
+	}
+
+	// Size the window from what THIS boot has actually observed, and from
+	// nothing else.
+	//
+	// The persisted baseline is deliberately not an input. Its error
+	// direction is the dangerous one: a baseline learned in a hotter spot
+	// overestimates lambda, an overestimate shortens the window, and a short
+	// window is exactly what invents false failure reports. Concretely, a
+	// baseline of 400 CPM captured next to a uranium-glass source pins the
+	// window at the 30 s floor; move the counter somewhere with a 1 CPM
+	// background and P(no counts in 30 s) is about 0.6, so it would cry
+	// hardware failure almost continuously on a perfectly good tube.
+	// Nothing at boot can tell us the environment did not change, so the
+	// stored value informs the operator and never the threshold.
+	//
+	// Two session sources, lower wins, because a lower lambda means a longer
+	// window means a claim that is harder to make:
+	//
+	//   counts so far   biased low on purpose, see below
+	//   min_avrg        measured floor over 300 s, valid after the settle
+	//                   gate; preferred when lower, since the running mean
+	//                   includes any time spent near a source
+	{
+		float lam = 0.0f;
+		uint32_t win = NSG_WIN_MAX_S;
+
+		// Subtract 2 sigma from the observed count so this is a lower bound
+		// on the rate rather than an estimate of it. 30 counts is the floor
+		// for the bound to mean anything; below that there is no evidence
+		// worth acting on and the window stays at the ceiling.
+		if (uptime >= 60u && total_cnt >= 30u) {
+			float n  = (float)total_cnt;
+			float lo = n - 2.0f * sqrtf(n);
+			if (lo > 0.0f) lam = lo / (float)uptime * 60.0f;
+		}
+		if (min_avrg < 1000.0f && (lam == 0.0f || min_avrg < lam)) {
+			lam = min_avrg;
+		}
+
+		// Below 0.1 CPM there is not enough signal to justify any claim.
+		if (lam >= 0.1f) {
+			// T = ln(10^p)/lambda, lambda in CPM -> seconds
+			float t = (float)NSG_P_EXP * 2.302585f / lam * 60.0f;
+			if (t < (float)NSG_WIN_MIN_S) t = (float)NSG_WIN_MIN_S;
+			if (t > (float)NSG_WIN_MAX_S) t = (float)NSG_WIN_MAX_S;
+			win = (uint32_t)t;
+		}
+		nsg_window_s = win;
+
+		if (nsg_enabled && silent_secs >= win) {
+			nsg_flag = true;
+		}
 	}
 
 	if (sec_tmr == 60) {
@@ -475,128 +662,64 @@ long map(long x, long in_min, long in_max, long out_min, long out_max) {
 	return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-void prepareDisp(void) {
-	char buf[24];
+// One render path for all three screens.
+//
+// There used to be two: prepareDisp for the button-driven redraw and dispCPM
+// for the 1 Hz refresh, each carrying its own copy of all three screens. They
+// had already drifted -- prepareDisp formatted VCC without ever reading the
+// ADC, so the info screen showed 0.000000 until the next tick -- and an
+// earlier divergence in the same pair is why dispMode needs a bounds check
+// before use. Sampling is now separate from drawing: the 1 Hz tick samples
+// then draws, a mode change only draws, so a redraw is idempotent and a mode
+// change shows real values immediately instead of empty chrome.
 
-	if (dispMode == 0) {
-		ssd1306_clear(&disp);
+static uint32_t disp_cpm;	// smoothed CPM for display, owned by sampleDisplay
 
-		ssd1306_draw_char(&disp, 0, 0, 1, 'R');
-		ssd1306_draw_char(&disp, 0, 8, 1, 'T');
-
-		if (uptime < 60) {
-			sprintf(buf, "[NV]");
-			ssd1306_draw_string(&disp, 8, 4, 1, buf);
-		}
-
-		sprintf(buf, "CPM");
-		ssd1306_draw_string(&disp, 98, 4, 1, buf);
-
-		sprintf(buf, "uSv");
-		ssd1306_draw_string(&disp, 98, 16, 1, buf);
-
-		sprintf(buf, "/h");
-		ssd1306_draw_string(&disp, 102, 24, 1, buf);
-
-		int k;
-		for (k = 0; k < 98; k++) {
-			if (k % 4 == 0) {
-				ssd1306_draw_pixel(&disp, k, 35);
-				ssd1306_draw_pixel(&disp, k, 63);
-			}
-		}
-		for (k = 35; k < 64; k++) {
-			if (k % 2 == 0) {
-				ssd1306_draw_pixel(&disp, 0, k);
-				ssd1306_draw_pixel(&disp, 100, k);
-			}
-		}
-
-		ssd1306_draw_line(&disp, 98, 35, 102, 35);
-		ssd1306_draw_line(&disp, 98, 63, 102, 63);
-
-		ssd1306_show(&disp);
-	} else
-	if (dispMode == 1) {
-		ssd1306_clear(&disp);
-
-		ssd1306_draw_char(&disp, 0, 0, 1, 'M');
-		ssd1306_draw_char(&disp, 0, 8, 1, 'A');
-
-		if (uptime < 300 + 60) {
-			sprintf(buf, "[NV]");
-			ssd1306_draw_string(&disp, 8, 4, 1, buf);
-		}
-
-		sprintf(buf,  "CPM");
-		ssd1306_draw_string(&disp, 98, 4, 1, buf);
-
-		sprintf(buf, "uSv");
-		ssd1306_draw_string(&disp, 98, 16, 1, buf);
-
-		sprintf(buf, "/h");
-		ssd1306_draw_string(&disp, 102, 24, 1, buf);
-
-		int k;
-		for (k = 0; k < 128; k++) {
-			if (k % 4 == 0) {
-				ssd1306_draw_pixel(&disp, k, 38);
-			}
-		}
-		for (k = 38; k < 64; k++) {
-			if (k % 3 == 0) {
-				ssd1306_draw_pixel(&disp, 92, k);
-			}
-		}
-
-		ssd1306_draw_string(&disp, 0, 44, 1, "MAX:");
-		ssd1306_draw_string(&disp, 0, 56, 1, "MIN:");
-
-		sprintf(buf, "N=");
-		ssd1306_draw_string(&disp, 98, 44, 1, buf);
-
-		sprintf(buf, "300");
-		ssd1306_draw_string(&disp, 98, 56, 1, buf);
-
-		ssd1306_show(&disp);
-	} else
-	if (dispMode == 2) {
-		ssd1306_clear(&disp);
-
-		sprintf(buf,  "FWV:%s", FW_VERSION);
-		ssd1306_draw_string(&disp, 0, 0, 1, buf);
-
-		sprintf(buf,  "TCN:%lu", total_cnt);
-		ssd1306_draw_string(&disp, 0, 9, 1, buf);
-
-		sprintf(buf,  "CH1:%lu", ch1_cnt);
-		ssd1306_draw_string(&disp, 0, 18, 1, buf);
-
-		sprintf(buf,  "CH2:%lu", ch2_cnt);
-		ssd1306_draw_string(&disp, 0, 27, 1, buf);
-
-		sprintf(buf,  "OTS:%lu", uptime);
-		ssd1306_draw_string(&disp, 0, 36, 1, buf);
-
-		sprintf(buf, "VCC:%f", result * conversion_factor);
-		ssd1306_draw_string(&disp, 0, 45, 1, buf);
-
-		ssd1306_show(&disp);
-	}
-
+// One status tag, highest priority first. [NV] means the averaging window is
+// still filling, so the figure on screen is not yet meaningful.
+static const char *statusTag(uint32_t settle) {
+	if (nsg_flag)        return "[NS]";
+	if (alarm_on)        return "[!!]";
+	if (uptime < settle) return "[NV]";
+	return NULL;
 }
 
-void dispCPM(void) {
-	uint8_t i, j;
+// Advances every per-second quantity. Must run exactly once per tick: the
+// graph queue and the SMA ring are state, not derived values, so folding this
+// into the renderer would fast-forward both on every button press.
+void sampleDisplay(void) {
+	uint8_t i;
 	uint32_t tmp;
-	char buf[24];
 
 	sma[sma_idx++] = cpm;
 	if (sma_idx == 4) sma_idx = 0;
 
-	tmp  = 0;
+	tmp = 0;
 	for (i = 0; i < 4; i++) tmp += sma[i];
 	tmp = ((tmp << 1) / 4 + 1) >> 1;
+
+	disp_cpm = tmp;
+
+	// Write at gbx then advance, which leaves gbx on the oldest slot -- where
+	// the renderer starts its walk.
+	gpq[gbx] = tmp;
+	gbx++;
+	if (gbx == 96) gbx = 0;
+
+	// Handed to the main loop rather than written here, so the display path
+	// and the serial path cannot stall each other.
+	cpm_out_value = tmp;
+	cpm_out_pending = true;
+}
+
+void drawScreen(void) {
+	uint8_t i, j;
+	char buf[24];
+	const char *tag;
+
+	// Guard the divisor once: gms is user-settable and a zero would put inf
+	// or nan on the dose line.
+	uint16_t gms = gamma_sensitivity ? gamma_sensitivity : 1;
 
 	if (dispMode == 0) {
 		ssd1306_clear(&disp);
@@ -604,20 +727,18 @@ void dispCPM(void) {
 		ssd1306_draw_char(&disp, 0, 0, 1, 'R');
 		ssd1306_draw_char(&disp, 0, 8, 1, 'T');
 
-		if (uptime < 60) {
-			sprintf(buf, "[NV]");
-			ssd1306_draw_string(&disp, 8, 4, 1, buf);
-		}
+		tag = statusTag(60);
+		if (tag) ssd1306_draw_string(&disp, 8, 4, 1, (char *)tag);
 
-		sprintf(buf, "%lu", tmp);
+		sprintf(buf, "%lu", (unsigned long)disp_cpm);
 		ssd1306_draw_string(&disp, 96 - strlen(buf) * 16, 0, 2, buf);
 
 		sprintf(buf, "CPM");
 		ssd1306_draw_string(&disp, 98, 4, 1, buf);
 
-		sprintf(buf, "%.4f", (float)tmp / gamma_sensitivity);
-		if(strlen(buf) > 6) {
-			sprintf(buf, "%.3f", (float)tmp / gamma_sensitivity);
+		sprintf(buf, "%.4f", (float)disp_cpm / gms);
+		if (strlen(buf) > 6) {
+			sprintf(buf, "%.3f", (float)disp_cpm / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 18, 2, buf);
 
@@ -628,54 +749,23 @@ void dispCPM(void) {
 		ssd1306_draw_string(&disp, 102, 24, 1, buf);
 
 		cmax = 0;
-		cmin = INT16_MAX;
-
-		gpq[gbx] = tmp;
-
-		for (i = 0; i<96; i++) {
-			if (gpq[i] > cmax) {
-				cmax = gpq[i];
-			}
+		for (i = 0; i < 96; i++) {
+			if (gpq[i] > cmax) cmax = gpq[i];
 		}
-
 		cmax = cmax + 8;
 		cmax = ((cmax / 10) + 1) * 10;
 		cmin = 0;
 
-		int y;
-
+		// Oldest sample first. The three hand-unrolled wrap cases this
+		// replaces all reduced to this single walk.
 		j = 0;
-		if(gbx != 95)  {
-			for (i = gbx + 1; i<96; i++) {
-				if (gpq[i]) {
-					y = map(gpq[i], cmin, cmax, 63, 34);
-					//ssd1306_draw_pixel(&disp, j++, y);
-					ssd1306_draw_line(&disp, j, y, j, 62);
-					j++;
-				}
+		for (i = 0; i < 96; i++) {
+			uint8_t idx = (uint8_t)((gbx + i) % 96);
+			if (gpq[idx]) {
+				int y = map(gpq[idx], cmin, cmax, 63, 34);
+				ssd1306_draw_line(&disp, j, y, j, 62);
+				j++;
 			}
-			for (i = 0; i <= gbx; i++) {
-				if (gpq[i]) {
-					y = map(gpq[i], cmin, cmax, 63, 34);
-					//ssd1306_draw_pixel(&disp, j++, y);
-					ssd1306_draw_line(&disp, j, y, j, 62);
-					j++;
-				}
-			}
-		} else {
-			for (i = 0; i<96; i++) {
-				if (gpq[i]) {
-					y = map(gpq[i], cmin, cmax, 63, 34);
-					//ssd1306_draw_pixel(&disp, j++, y);
-					ssd1306_draw_line(&disp, j, y, j, 62);
-					j++;
-				}
-			}
-		}
-
-		gbx++;
-		if (gbx==96) {
-			gbx = 0;
 		}
 
 		int k;
@@ -695,10 +785,10 @@ void dispCPM(void) {
 		ssd1306_draw_line(&disp, 98, 35, 102, 35);
 		ssd1306_draw_line(&disp, 98, 63, 102, 63);
 
-		sprintf(buf,  "%d", (int)cmax);
+		sprintf(buf, "%d", (int)cmax);
 		ssd1306_draw_string(&disp, 104, 36, 1, buf);
 
-		sprintf(buf,  "%d", (int)cmin);
+		sprintf(buf, "%d", (int)cmin);
 		ssd1306_draw_string(&disp, 104, 56, 1, buf);
 
 		ssd1306_show(&disp);
@@ -709,22 +799,20 @@ void dispCPM(void) {
 		ssd1306_draw_char(&disp, 0, 0, 1, 'M');
 		ssd1306_draw_char(&disp, 0, 8, 1, 'A');
 
-		if (uptime < 300 + 60) {
-			sprintf(buf, "[NV]");
-			ssd1306_draw_string(&disp, 8, 4, 1, buf);
-		}
+		tag = statusTag(300 + 60);
+		if (tag) ssd1306_draw_string(&disp, 8, 4, 1, (char *)tag);
 
-		sprintf(buf,  "%.2f", avrg);
+		sprintf(buf, "%.2f", avrg);
 		ssd1306_draw_string(&disp, 96 - 24, 7, 1, buf + strlen(buf) - 3);
 		buf[strlen(buf) - 3] = 0;
 		ssd1306_draw_string(&disp, 96 - strlen(buf) * 16 - 24 + 4, 0, 2, buf);
 
-		sprintf(buf,  "CPM");
+		sprintf(buf, "CPM");
 		ssd1306_draw_string(&disp, 98, 4, 1, buf);
 
-		sprintf(buf, "%.4f", avrg / gamma_sensitivity);
-		if(strlen(buf) > 6) {
-			sprintf(buf, "%.3f", (float)avrg / gamma_sensitivity);
+		sprintf(buf, "%.4f", avrg / gms);
+		if (strlen(buf) > 6) {
+			sprintf(buf, "%.3f", avrg / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 18, 2, buf);
 
@@ -749,14 +837,14 @@ void dispCPM(void) {
 		if (uptime < 300 + 60) {
 			sprintf(buf, "MAX: UD");
 		} else {
-			sprintf(buf, "MAX:%.4f", max_avrg / gamma_sensitivity);
+			sprintf(buf, "MAX:%.4f", max_avrg / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 44, 1, buf);
 
 		if (uptime < 300 + 60) {
 			sprintf(buf, "MIN: UD");
 		} else {
-			sprintf(buf, "MIN:%.4f", min_avrg / gamma_sensitivity);
+			sprintf(buf, "MIN:%.4f", min_avrg / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 56, 1, buf);
 
@@ -771,21 +859,23 @@ void dispCPM(void) {
 	if (dispMode == 2) {
 		ssd1306_clear(&disp);
 
-		sprintf(buf,  "FWV:%s", FW_VERSION);
+		sprintf(buf, "FWV:%s", FW_VERSION);
 		ssd1306_draw_string(&disp, 0, 0, 1, buf);
 
-		sprintf(buf,  "TCN:%lu", total_cnt);
+		sprintf(buf, "TCN:%lu", total_cnt);
 		ssd1306_draw_string(&disp, 0, 9, 1, buf);
 
-		sprintf(buf,  "CH1:%lu", ch1_cnt);
+		sprintf(buf, "CH1:%lu", ch1_cnt);
 		ssd1306_draw_string(&disp, 0, 18, 1, buf);
 
-		sprintf(buf,  "CH2:%lu", ch2_cnt);
+		sprintf(buf, "CH2:%lu", ch2_cnt);
 		ssd1306_draw_string(&disp, 0, 27, 1, buf);
 
-		sprintf(buf,  "OTS:%lu", uptime);
+		sprintf(buf, "OTS:%lu", uptime);
 		ssd1306_draw_string(&disp, 0, 36, 1, buf);
 
+		// Read immediately before formatting. The old button-driven path
+		// printed a stale global here.
 		result = adc_read();
 
 		sprintf(buf, "VCC:%f", result * conversion_factor);
@@ -793,13 +883,6 @@ void dispCPM(void) {
 
 		ssd1306_show(&disp);
 	}
-
-	// The CPM value is handed to the main loop rather than written here.
-	// dispCPM is called from thread context now, but keeping the wire write
-	// out of this function means the display path and the serial path cannot
-	// stall each other.
-	cpm_out_value = tmp;
-	cpm_out_pending = true;
 }
 
 // The `reboot` command goes through the watchdog, so tag it or it would look
@@ -995,17 +1078,45 @@ void SerCmdExec(void) {
 	} else
 	if (memcmp((char*)CmdBuf, "set ", 4) == 0) {
 		ptr = (char*)CmdBuf + 4;
+		// All three of these land in a uint16_t, and atoi returns int, so an
+		// out-of-range entry used to wrap silently: `set atc=99999` stored
+		// 34463 and reported it back as if accepted. Clamp instead, so the
+		// value read back is the value in force.
 		if (memcmp(ptr, "gms=", 4) == 0) {
-			ptr += 4;
-			gamma_sensitivity = atoi(ptr);
+			// Also the divisor on the dose line: a zero would render inf or
+			// nan as a radiation reading.
+			long v = atol(ptr + 4);
+			if (v < 1)     v = 1;
+			if (v > 65535) v = 65535;
+			gamma_sensitivity = (uint16_t)v;
 		} else
 		if (memcmp(ptr, "atc=", 4) == 0) {
-			ptr += 4;
-			alarm_trigger_cpm = atoi(ptr);
+			long v = atol(ptr + 4);
+			if (v < 0)     v = 0;
+			if (v > 65535) v = 65535;
+			alarm_trigger_cpm = (uint16_t)v;
 		} else
 		if (memcmp(ptr, "hvg=", 4) == 0) {
-			ptr += 4;
-			hvg_pulsewidth = atoi(ptr);
+			// Bounded to the range the slice can actually express: 1..wrap.
+			//
+			// 0 is excluded for the same reason the boot path refuses it.
+			// Under this slice's inverted polarity, high-side duty is
+			// (wrap+1-level)/(wrap+1), so level 0 is 100% duty into the HV
+			// generator -- the maximum-energy extreme. Rejecting it at boot
+			// but honouring it here would have made the validation
+			// decorative.
+			//
+			// Above the wrap the comparator never trips and the channel
+			// saturates, so a larger number does not mean a larger pulse; it
+			// means the reported setting stops describing what drives the
+			// tube. Between those ends the firmware has no basis to judge a
+			// safe bias for a given tube, so it does not narrow further.
+			long v = atol(ptr + 4);
+			if (v < 1)    v = 1;
+			if (v > 2047) v = 2047;
+			hvg_pulsewidth = (uint16_t)v;
+			// The operator has asserted a value, so it is savable again.
+			hvg_trusted = true;
 			pwm_set_chan_level(hvgPwmSlice, PWM_CHAN_A, hvg_pulsewidth);
 		} else
 		if (memcmp(ptr, "bps=", 4) == 0) {
@@ -1036,19 +1147,62 @@ void SerCmdExec(void) {
 			if (memcmp(ptr, "off", 3) == 0) {
 				ssd1306_poweroff(&disp);
 			}
+		} else
+		if (memcmp(ptr, "nsg=", 4) == 0) {
+			ptr += 4;
+			if (memcmp(ptr, "on", 2) == 0) {
+				nsg_enabled = true;
+			} else
+			if (memcmp(ptr, "off", 3) == 0) {
+				nsg_enabled = false;
+				nsg_flag = false;
+			}
+		} else
+		if (memcmp(ptr, "dsp=", 4) == 0) {
+			// The screen could previously only be changed by the on-board
+			// button, which is no use on a board that lives in a rack, and
+			// left the persistence path untestable without physical access.
+			int v = atoi(ptr + 4);
+			if (v >= 0 && v <= MODEMAX) {
+				dispMode = (uint8_t)v;
+				eeprom_write_byte(OFS_DISPMODE, dispMode);
+				pd = true;
+			}
 		}
 	} else
 	if (memcmp((char*)CmdBuf, "save", 4) == 0) {
 		eeprom_write_word(OFS_GMS, gamma_sensitivity);
 		eeprom_write_word(OFS_ALARM, alarm_trigger_cpm);
-		eeprom_write_word(OFS_PWM_WIDTH, hvg_pulsewidth);
+		// Never write the parked placeholder back: that would bake it into
+		// storage as if it were calibration, and the next boot would trust
+		// it. An explicit `set hvg` asserts a real value and makes it
+		// savable again.
+		if (hvg_trusted) eeprom_write_word(OFS_PWM_WIDTH, hvg_pulsewidth);
 		eeprom_write_byte(OFS_SOUND, (is_sound_enabled == true)? 1 : 0);
+		// The EEPROM has always had a slot for the selected screen and
+		// nothing ever wrote it, so the choice was lost on every power cycle.
+		eeprom_write_byte(OFS_DISPMODE, dispMode);
 	} else
 	if (memcmp((char*)CmdBuf, "show", 4) == 0) {
 		printf("ttc: %lu\r\n", (unsigned long)total_cnt);
 		printf("gms: %u\r\n", gamma_sensitivity);
 		printf("atc: %u\r\n", alarm_trigger_cpm);
 		printf("hvg: %u\r\n", hvg_pulsewidth);
+		// 1 = the pulse width came from valid storage or an explicit set.
+		// 0 = storage was unusable, the generator is parked at the
+		// minimum-energy end, and hvg above is a placeholder, not
+		// calibration.
+		printf("hvs: %u\r\n", hvg_trusted ? 1u : 0u);
+		printf("dsp: %u\r\n", (unsigned)dispMode);
+		printf("alm: %u\r\n", alarm_on ? 1u : 0u);
+		// enabled, length of the current silent run, window it is judged against
+		printf("nsg: %u %lu %lu\r\n", nsg_enabled ? 1u : 0u,
+		       (unsigned long)silent_secs, (unsigned long)nsg_window_s);
+		// Background floor this board has recorded, as operator context. It
+		// does not size the window above -- that comes from the current
+		// session only.
+		printf("bas: %u.%u\r\n", baseline_saved_x10 / 10u,
+		       baseline_saved_x10 % 10u);
 		printf("tsl: %lu %lu\r\n", (unsigned long)ts_lost[0], (unsigned long)ts_lost[1]);
 		printf("eer: %lu\r\n", (unsigned long)eeprom_err);
 		printf("ots: %lu\r\n", (unsigned long)uptime);
@@ -1058,7 +1212,35 @@ void SerCmdExec(void) {
 		software_reset();
 	} else
 	if (memcmp((char*)CmdBuf, "factry", 6) == 0) {
+		// Operator preferences only.
+		//
+		// gms and hvg are per-board calibration: gms is this tube's
+		// counts-per-uSv/h, hvg sets the tube's supply voltage. This
+		// firmware holds no record of their factory values, so restoring
+		// them would mean inventing numbers -- and an invented hvg
+		// mis-biases the detector. They are left alone, and the command
+		// reports which side of that line each setting fell on rather than
+		// leaving the operator to guess how much was reset.
+		alarm_trigger_cpm = 0;
+		is_sound_enabled = true;
+		dispMode = 0;
+		nsg_enabled = true;
+		nsg_flag = false;
+		baseline_x10 = 0;
+		baseline_saved_x10 = 0;
+		min_avrg = 1000.00f;
+		max_avrg = 0.00f;
 
+		eeprom_write_word(OFS_ALARM, 0);
+		eeprom_write_byte(OFS_SOUND, 1);
+		eeprom_write_byte(OFS_DISPMODE, 0);
+		eeprom_write_word(OFS_BASECPM, 0);
+
+		pd = true;
+
+		printf("reset: atc snd dsp bas\r\n");
+		printf("kept: gms=%u hvg=%u (per-board calibration)\r\n",
+		       gamma_sensitivity, hvg_pulsewidth);
 	} else
 	if (memcmp((char*)CmdBuf, "dfu", 3) == 0) {
 		ssd1306_clear(&disp);
@@ -1322,7 +1504,26 @@ int main() {
 	eeprom_read_byte(OFS_SOUND, &soundMode);
 	is_sound_enabled = (soundMode & 0x01) ? true : false;
 
+	// Validate before this ever reaches the PWM.
+	//
+	// hvg_pulsewidth is a global initialised to 0, and eeprom_read_word
+	// leaves its target untouched when the I2C transfer fails -- so a stuck
+	// bus left 0 here, and 0 against this slice is the maximum-energy end of
+	// the range, not the minimum: the slice runs with inverted polarity, so
+	// high-side duty is (wrap+1-level)/(wrap+1). Level 0 is 100% duty into
+	// the HV generator. An erased cell (0xFFFF) exceeds the 2047 wrap and
+	// saturates the other way.
+	//
+	// Neither is a calibration, so neither should be applied. This firmware
+	// has no way to know a safe bias for a given tube, so it refuses to
+	// invent one: an implausible stored value parks the generator at the
+	// minimum-energy end and says so, rather than guessing a voltage. The
+	// board then reads zero counts, which the no-signal supervision reports.
 	eeprom_read_word(OFS_PWM_WIDTH, &hvg_pulsewidth);
+	if (hvg_pulsewidth == 0 || hvg_pulsewidth > 2047) {
+		hvg_pulsewidth = 2047;
+		hvg_trusted = false;
+	}
 
 	gpio_init(LED_PIN);		// DETECTION INDICATOR LED
 	gpio_set_dir(LED_PIN, GPIO_OUT);
@@ -1378,17 +1579,25 @@ int main() {
 	// Seed each local from its global. eeprom_read_* returns without writing
 	// through the pointer when the I2C transfer fails, so an uninitialised
 	// local would leave stack garbage in the global. dispMode in particular
-	// must stay within MODEMAX: dispCPM tests it against each mode in turn and
-	// draws nothing at all if none match, freezing the display.
+	// must stay within MODEMAX: drawScreen tests it against each mode in turn
+	// and draws nothing at all if none match, freezing the display.
 	uint16_t gms_init = gamma_sensitivity;
 	uint16_t alarm_init = alarm_trigger_cpm;
 	uint8_t  dispmode_init = dispMode;
+	uint16_t base_init = baseline_saved_x10;
 	eeprom_read_word(OFS_GMS, &gms_init);
 	eeprom_read_word(OFS_ALARM, &alarm_init);
 	eeprom_read_byte(OFS_DISPMODE, &dispmode_init);
-	gamma_sensitivity = gms_init;
+	eeprom_read_word(OFS_BASECPM, &base_init);
+	// A blank cell reads as 0xFFFF, which as a background would be nonsense
+	// and would size the silence window off a fictional 6553 CPM. Treat it,
+	// and anything implausibly high for a background, as "not learned yet".
+	if (base_init == 0xFFFF || base_init > 20000) base_init = 0;
+	gamma_sensitivity = gms_init ? gms_init : 1;
 	alarm_trigger_cpm = alarm_init;
 	dispMode = (dispmode_init > MODEMAX) ? 0 : dispmode_init;
+	baseline_saved_x10 = base_init;
+	baseline_x10 = base_init;
 
 	cmax = 0;
 	cptr = 0;
@@ -1425,6 +1634,11 @@ int main() {
 				if (dispMode > MODEMAX) {
 					dispMode = 0;
 				}
+				// Persist the choice. Button-driven, so this is rare enough
+				// that the ~10 ms interrupts-off window in the write costs at
+				// most a single count, and it matches what the long press
+				// already does for the mute setting.
+				eeprom_write_byte(OFS_DISPMODE, dispMode);
 				pd = true;
 			}
 
@@ -1448,20 +1662,35 @@ int main() {
 
 		sout     = (want == OUT_CPM);
 		evt_mode = (want == OUT_EVT);
-		// Deferred display work. Both calls blit the framebuffer over I2C and
+		// Deferred display work. Both paths blit the framebuffer over I2C and
 		// block for ~23 ms, so they run here with interrupts enabled rather
 		// than inside the timer callback that used to invoke them.
-		if (pd) {
-			pd = false;
-			prepareDisp();
-		}
+		//
+		// A mode change only redraws; the 1 Hz tick samples first, because
+		// the graph queue and SMA ring advance once per second and must not
+		// be fast-forwarded by a button press.
 		if (ui_refresh_req) {
 			ui_refresh_req = false;
-			dispCPM();
+			sampleDisplay();
+			pd = true;
+		}
+		if (pd) {
+			pd = false;
+			drawScreen();
 		}
 		if (cpm_out_pending) {
 			cpm_out_pending = false;
 			if (sout) printf("%lu\n", (unsigned long)cpm_out_value);
+		}
+
+		// Learned background, written here and never from the timer: the
+		// EEPROM helpers hold interrupts off for up to 10 ms, which at these
+		// rates loses a count. The deadband upstream keeps this to a handful
+		// of writes over the life of the board.
+		if (baseline_save_req) {
+			baseline_save_req = false;
+			eeprom_write_word(OFS_BASECPM, baseline_x10);
+			baseline_saved_x10 = baseline_x10;
 		}
 
 		if (evt_mode) {
