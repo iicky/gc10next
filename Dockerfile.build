@@ -11,7 +11,14 @@ RUN git clone https://github.com/raspberrypi/pico-sdk.git /pico-sdk \
 
 ENV PICO_SDK_PATH=/pico-sdk
 
-ARG FW_BUILD_ID=dev
+# No default: this stage has no .git, so CMake cannot derive the commit here.
+# A default would let an unstamped image build and label itself, which is worse
+# than not building at all. Fail before the compile instead.
+ARG FW_BUILD_ID
+RUN test -n "${FW_BUILD_ID}" || { \
+	echo "ERROR: this build requires --build-arg FW_BUILD_ID=<short git sha>" >&2; \
+	exit 1; \
+    }
 WORKDIR /src
 COPY main.c ssd1306.c ssd1306.h eeprom.h font.h image.h pulse_ts.pio CMakeLists.txt pico_sdk_import.cmake ./
 
