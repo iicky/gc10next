@@ -55,13 +55,12 @@
 // by wall-clock hold time rather than by a poll count, so the thresholds stay
 // fixed if the loop rate changes. ~500 ms matches the pre-existing long-press
 // feel (21 polls x ~25 ms under the old every-pass polling).
-// 2, not 4: the settle cut below already takes the masked window from ~146 us
-// to ~29 us, so every 2nd pass costs 0.058% interrupts-off duty against 0.029%
-// for every 4th. That 0.029% of counts is far inside Poisson noise and affects
-// only the display counters, never the PIO capture path -- not worth risking a
-// missed tap on the board's only control, since a press must span a poll to be
-// seen at all.
-#define BOOTSEL_POLL_DIV 2      // poll every 2nd pass (~50 ms)
+// 4, not 2: this is the value the branch was originally verified with before
+// publication. The settle cut below already takes the masked window from
+// ~146 us to ~29 us, and every 4th pass keeps the remaining duty down at
+// ~0.029% without changing the long-press timing, since that now uses the
+// real clock rather than a poll count.
+#define BOOTSEL_POLL_DIV 4      // poll every 4th pass (~100 ms)
 #define LONGPRESS_MS     500u   // held >= this = long press, else short press
 
 const uint LED_PIN = 25;
