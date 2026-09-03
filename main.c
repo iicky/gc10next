@@ -561,13 +561,15 @@ bool secTimer_callback(repeating_timer_t *rt) {
 		if (avrg < min_avrg)
 			min_avrg = avrg;
 
-		// Persist the learned floor, but only when it has moved materially
-		// and only via the main loop. eeprom_write_word holds interrupts off
-		// for up to 10 ms, which at these rates loses a count, and avrg
-		// updates every second -- writing as it learns would both drop counts
-		// continuously and wear the part out in days. A 25% deadband plus
-		// min_avrg being monotonic within a boot means this settles to a
-		// handful of writes for the life of the board.
+		// Persist the learned floor, but only when it has moved materially.
+		// This callback only raises baseline_save_req; the main loop performs
+		// the write, with interrupts enabled throughout. The write no longer
+		// masks interrupts, so it costs no counts -- but it still blocks its
+		// caller for up to ~15 ms (I2C timeout plus the write cycle), which
+		// belongs in the loop rather than in a 1 Hz timer callback. avrg also
+		// updates every second, so writing as it learns would wear the part
+		// out in days. A 25% deadband plus min_avrg being monotonic within a
+		// boot settles this to a handful of writes for the life of the board.
 		uint16_t want = (uint16_t)(min_avrg * 10.0f + 0.5f);
 		uint16_t ref  = baseline_saved_x10;
 		if (want != ref && (want < (ref - ref / 4) || want > (ref + ref / 4))) {
@@ -922,42 +924,68 @@ void software_reset() {
 	while(1);
 }
 
+// --- EEPROM helpers -------------------------------------------------------
+//
+// These used to wrap each I2C transaction in save_and_disable_interrupts() /
+// restore_interrupts(). That was load-bearing only back when SerCmdExec ran
+// inside UART1_IRQ and could re-enter a transfer already in flight from the
+// main loop; command parsing has since moved to thread context, so the mask
+// now guards nothing. With the 10 ms bus timeout it masked interrupts for up
+// to 10 ms per call, and because the RP2040 GPIO edge latch is a single sticky
+// bit per pin, every detection edge in that window collapsed into one callback
+// -- so each EEPROM access could silently cost a count on the GPIO counters.
+// The mask is removed. Two invariants make that safe:
+//
+//   1. No IRQ-context callers. Every eeprom_* call site is thread context:
+//      SerCmdExec (driven from the main loop, not UART1_IRQ), main() init, and
+//      the main loop's button/baseline writes. gpio_callback, msecTimer_callback,
+//      secTimer_callback, and on_uart_rx never touch the EEPROM, so no transfer
+//      can be re-entered.
+//   2. Single device on i2c0. i2c_default (== i2c0) carries only the EEPROM at
+//      0x50; the OLED lives on i2c1 at 0x3C, so nothing else contends for this
+//      controller.
+//
+// RESTORE THE MASK if either invariant ever breaks -- i.e. if any eeprom_* call
+// gains an interrupt-context caller, or a second device is put on i2c0. The
+// 10 ms timeouts stay (they stop a stuck bus hanging the board) and the
+// sleep_ms(5) write-cycle delays stay.
 void eeprom_write_byte (uint16_t addr, uint8_t val) {
 	uint8_t src[1 + 1];
-	uint32_t flags = save_and_disable_interrupts();
 
 	src[0] = addr & 0xFF;
 	src[1] = val;
 
-	// No printf here: this runs with interrupts disabled, and the original
-	// calls passed no argument for %s, so any bus error dereferenced a junk
-	// pointer. Count the failure and let the main loop report it.
-	if (i2c_write_timeout_us(i2c_default, 0x50, src, 2, false, 10000) < 0) eeprom_err++;
-	restore_interrupts(flags);
+	// No printf here: the original calls passed no argument for %s, so any bus
+	// error dereferenced a junk pointer. Count the failure and let the main
+	// loop report it.
+	//
+	// Compare against the byte count, not against 0. A negative return is an
+	// address NACK or a timeout, but the SDK reports a data-byte NACK as a
+	// NONNEGATIVE short count (the ABRT_TXDATA_NOACK branch of
+	// i2c_write_blocking_internal returns byte_ctr), so a `< 0` test scores a
+	// partially written cell as a success and eer never mentions it. The read
+	// helpers below already compare against their expected length.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 2, false, 10000) != 2) eeprom_err++;
 
 	sleep_ms(5);
 }
 
 void eeprom_write_word (uint16_t addr, uint16_t val) {
 	uint8_t src[1 + 2];
-	uint32_t flags = save_and_disable_interrupts();
 
 	src[0] = addr & 0xFF;
 	src[1] = val  & 0xFF;
 	src[2] = val >> 8;
 
-	// No printf here: this runs with interrupts disabled, and the original
-	// calls passed no argument for %s, so any bus error dereferenced a junk
-	// pointer. Count the failure and let the main loop report it.
-	if (i2c_write_timeout_us(i2c_default, 0x50, src, 3, false, 10000) < 0) eeprom_err++;
-	restore_interrupts(flags);
+	// See eeprom_write_byte: a short write returns a nonnegative count, so
+	// this must compare against the length rather than test for negative.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 3, false, 10000) != 3) eeprom_err++;
 
 	sleep_ms(5);
 }
 
 void eeprom_write_long (uint16_t addr, uint32_t val) {
 	uint8_t src[1 + 4];
-	uint32_t flags = save_and_disable_interrupts();
 
 	src[0] = addr & 0xFF;
 	src[1] = val  & 0xFF;
@@ -965,11 +993,9 @@ void eeprom_write_long (uint16_t addr, uint32_t val) {
 	src[3] = (val >> 16) & 0xFF;
 	src[4] = (val >> 24) & 0xFF;
 
-	// No printf here: this runs with interrupts disabled, and the original
-	// calls passed no argument for %s, so any bus error dereferenced a junk
-	// pointer. Count the failure and let the main loop report it.
-	if (i2c_write_timeout_us(i2c_default, 0x50, src, 5, false, 10000) < 0) eeprom_err++;
-	restore_interrupts(flags);
+	// See eeprom_write_byte: a short write returns a nonnegative count, so
+	// this must compare against the length rather than test for negative.
+	if (i2c_write_timeout_us(i2c_default, 0x50, src, 5, false, 10000) != 5) eeprom_err++;
 
 	sleep_ms(5);
 }
@@ -979,25 +1005,20 @@ int eeprom_read_byte(int addr, uint8_t *p)
 	uint8_t src;
     uint8_t rx;
     int ret;
-	uint32_t flags = save_and_disable_interrupts();
 
 	src = (uint8_t)addr;
 
 	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
-		restore_interrupts(flags);
 		return ret;
     }
 
     ret = i2c_read_timeout_us(i2c_default, 0x50, &rx, 1, false, 10000);
     if (ret != 1) {
-		restore_interrupts(flags);
 		return ret;
     }
 
 	*p = rx;
-
-	restore_interrupts(flags);
 
 	return PICO_OK;
 }
@@ -1007,25 +1028,20 @@ int eeprom_read_word(int addr, uint16_t *p)
 	uint8_t src;
     uint8_t rx[2];
     int ret;
-	uint32_t flags = save_and_disable_interrupts();
 
 	src = (uint8_t)addr;
 
 	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
-		restore_interrupts(flags);
 		return ret;
     }
 
     ret = i2c_read_timeout_us(i2c_default, 0x50, rx, 2, false, 10000);
     if (ret != 2) {
-		restore_interrupts(flags);
 		return ret;
     }
 
 	*p = *(uint16_t*)rx;
-
-	restore_interrupts(flags);
 
 	return PICO_OK;
 }
@@ -1035,25 +1051,20 @@ int eeprom_read_long(int addr, uint32_t *p)
 	uint8_t src;
     uint8_t rx[4];
     int ret;
-	uint32_t flags = save_and_disable_interrupts();
 
 	src = (uint8_t)addr;
 
 	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
     if (ret != 1) {
-		restore_interrupts(flags);
 		return ret;
     }
 
     ret = i2c_read_timeout_us(i2c_default, 0x50, rx, 4, false, 10000);
     if (ret != 4) {
-		restore_interrupts(flags);
 		return ret;
     }
 
 	*p = *(uint32_t*)rx;
-
-	restore_interrupts(flags);
 
 	return PICO_OK;
 }
@@ -1063,25 +1074,20 @@ int eeprom_read_page(int addr, uint8_t *p, size_t len)
 	uint8_t src;
 	uint8_t rx[16];
 	int ret;
-	uint32_t flags = save_and_disable_interrupts();
 
 	src = (uint8_t)addr;
 
 	ret = i2c_write_timeout_us(i2c_default, 0x50, &src, 1, true, 10000);
 	if (ret != 1) {
-		restore_interrupts(flags);
 		return ret;
 	}
 
 	ret = i2c_read_timeout_us(i2c_default, 0x50, rx, len, false, 10000);
 	if (ret < 0 || (size_t)ret != len) {
-		restore_interrupts(flags);
 		return ret;
 	}
 
 	memcpy(p, rx, len);
-
-	restore_interrupts(flags);
 
 	return PICO_OK;
 }
