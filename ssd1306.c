@@ -47,22 +47,36 @@ inline static void swap(int32_t *a, int32_t *b) {
     *b=t;
 }
 
-inline static void fancy_write(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, char *name) {
-    switch(i2c_write_timeout_us(i2c, addr, src, len, false, 50000)) {
-    case PICO_ERROR_GENERIC:
-        printf("[%s] addr not acknowledged!\n", name);
-        break;
-    case PICO_ERROR_TIMEOUT:
-        printf("[%s] timeout!\n", name);
-        break;
-    default:
-        break;
+// I2C failures on the display bus were previously only printf'd here and then
+// dropped. Two problems with that: a caller had no way to learn the panel had
+// died (the screen just froze on its last frame), and on a wedged bus (stuck
+// SDA, dead panel) this printf'd on every byte of every frame -- an unbounded
+// log flooding the same stdout the event stream uses. So instead of returning
+// a status up through ssd1306_write/ssd1306_show (which would mean changing
+// every command-write call site in this vendored driver -- a wide refactor for
+// no extra signal), we count failures in a single global the main-loop `show`
+// command reports. display_err lives in main.c beside eeprom_err; the driver
+// reaches it by extern. It is only ever written from here, all of which runs in
+// main-loop context, so no synchronisation is needed -- volatile just mirrors
+// eeprom_err. The old `name` parameter existed only for the removed printfs.
+extern volatile uint32_t display_err;
+
+inline static void fancy_write(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len) {
+    // Any outcome that is not "every byte accepted" is a failure. A negative
+    // return is an address NACK or a bus timeout, but the SDK also reports a
+    // data-byte NACK as a NONNEGATIVE short count -- see the
+    // ABRT_TXDATA_NOACK branch of i2c_write_blocking_internal, which returns
+    // byte_ctr. Switching on the two error constants alone would score a
+    // partial blit as success, which is the failure this counter exists to
+    // make visible, so compare against the length instead.
+    if (i2c_write_timeout_us(i2c, addr, src, len, false, 50000) != (int)len) {
+        ++display_err;
     }
 }
 
 inline static void ssd1306_write(ssd1306_t *p, uint8_t val) {
     uint8_t d[2]= {0x00, val};
-    fancy_write(p->i2c_i, p->address, d, 2, "ssd1306_write");
+    fancy_write(p->i2c_i, p->address, d, 2);
 }
 
 bool ssd1306_init(ssd1306_t *p, uint16_t width, uint16_t height, uint8_t address, i2c_inst_t *i2c_instance) {
@@ -305,5 +319,5 @@ void ssd1306_show(ssd1306_t *p) {
 
     *(p->buffer-1)=0x40;
 
-    fancy_write(p->i2c_i, p->address, p->buffer-1, p->bufsize+1, "ssd1306_show");
+    fancy_write(p->i2c_i, p->address, p->buffer-1, p->bufsize+1);
 }
