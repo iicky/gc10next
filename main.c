@@ -47,6 +47,13 @@
 #define FW_BUILD_ID "dev"
 #endif
 #define FW_VERSION "FWNX1E-" FW_BUILD_ID
+// Keep one concrete object with the full version bytes. After the build-time
+// FW_BUILD_ID change the final UF2 still carried the SHA, but the compiler no
+// longer left `FWNX1E-<id>` as one contiguous C string in the image, so
+// `strings` stopped recovering it even though `ver` still printed it. Using a
+// real array here preserves the exact runtime value and keeps the built image
+// self-identifying on disk, which is how the tracked UF2 has been audited.
+static const char fw_version[] = FW_VERSION;
 #define MODEMAX 2
 #define TOTAL_NUM 300
 
@@ -915,11 +922,10 @@ void drawScreen(void) {
 	if (dispMode == 2) {
 		ssd1306_clear(&disp);
 
-		// FW_VERSION is "FWNX1E-" + FW_BUILD_ID; the build id is whatever the
-		// build passes, so a full 40-char SHA would overrun buf[24] under plain
-		// sprintf and corrupt the stack. snprintf truncates instead: a bad
-		// build argument yields an ugly splash line, never memory corruption.
-		snprintf(buf, sizeof(buf), "FWV:%s", FW_VERSION);
+		// fw_version is a concrete array holding the exact runtime version
+		// string; see its definition near FW_VERSION above. snprintf keeps the
+		// splash line bounded even if a build passes an unusually long id.
+		snprintf(buf, sizeof(buf), "FWV:%s", fw_version);
 		ssd1306_draw_string(&disp, 0, 0, 1, buf);
 
 		snprintf(buf, sizeof(buf), "TCN:%lu", total_cnt);
@@ -1343,14 +1349,13 @@ void SerCmdExec(void) {
 		uint8_t pmn[8 + 1];   // room for a terminator: the field may fill all 8
 		memset(pmn, 0, sizeof(pmn));
 		uint8_t rev[2];
-
 		eeprom_read_page(OFS_MODELNAME, pmn, 8);   // pmn[8] stays NUL
 		eeprom_read_word(OFS_BDREV, (uint16_t*)rev);
 
 		printf("%s\n", pmn);
 		printf("%02X%02X\n", rev[1],rev[0]);
 
-		printf("%s\r\n", FW_VERSION);
+		printf("%s\r\n", fw_version);
 	}
 }
 
@@ -1503,14 +1508,13 @@ void title() {
 	if (isDual) {
 		ssd1306_draw_string(&disp, 80, 20, 1, "<Dual>");
 	}
-
 	ssd1306_show(&disp);
 
 
 	sleep_ms(220);
 
 	ssd1306_draw_string(&disp, 6, 54, 1, "FW:");
-	ssd1306_draw_string(&disp, 30, 54, 1, FW_VERSION);
+	ssd1306_draw_string(&disp, 30, 54, 1, (char *)fw_version);
 
 	ssd1306_show(&disp);
 	sleep_ms(740);
