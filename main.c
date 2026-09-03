@@ -254,6 +254,15 @@ static volatile bool     ui_refresh_req = false;   // redraw the measurement scr
 static volatile bool     cpm_out_pending = false;  // a CPM value is due on the wire
 static volatile uint32_t cpm_out_value = 0;
 static volatile uint32_t eeprom_err = 0;   // I2C failures, reported by `show`
+// Same idea for the display bus (i2c1): a wedged panel or stuck SDA would
+// otherwise freeze the screen on its last frame with nothing reporting it --
+// the same silent failure the dead-detector supervision exists to catch.
+// fancy_write in the vendored ssd1306.c increments this on a failed blit, so
+// unlike eeprom_err it cannot be `static`: the driver reaches it by `extern`.
+// Only ever touched from main-loop context (all blits happen there, never in
+// the timer callback -- see the drawScreen note below), same as eeprom_err;
+// volatile is kept only to mirror eeprom_err's declaration.
+volatile uint32_t display_err = 0;   // display I2C failures, reported by `show`
 
 // Silent-reboot telemetry: CONSECUTIVE watchdog resets since power-on, not a
 // general reset count -- any non-watchdog reset (power cycle, BOOTSEL, DFU)
@@ -1284,6 +1293,7 @@ void SerCmdExec(void) {
 		       baseline_saved_x10 % 10u);
 		printf("tsl: %lu %lu\r\n", (unsigned long)ts_lost[0], (unsigned long)ts_lost[1]);
 		printf("eer: %lu\r\n", (unsigned long)eeprom_err);
+		printf("der: %lu\r\n", (unsigned long)display_err);
 		printf("ots: %lu\r\n", (unsigned long)uptime);
 		printf("wdt: %lu\r\n", (unsigned long)wdt_reboots);
 	} else
