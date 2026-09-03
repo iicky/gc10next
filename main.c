@@ -119,10 +119,18 @@ uint8_t sec_tmr;
 uint8_t sma_idx;
 
 uint8_t gbx = 0;	// graph plotting queue index
-uint16_t gpq[96];	// queue for graph plotting
+// Holds the smoothed CPM samples for the trend graph. Was uint16_t, which
+// wrapped any sample above 65535 -- the SBM-20's ~190us dead time caps the
+// physical rate near 315k CPM, so that is reachable in a strong field, not
+// theoretical. uint32_t matches the smoothed CPM (disp_cpm) fed into it.
+uint32_t gpq[96];	// queue for graph plotting
 
-int16_t cmax;
-int16_t cmin;
+// Graph scale bounds. Were int16_t, so a sample above 32767 overflowed cmax
+// negative and inverted the map() scaling. Widened to int32_t: the physical
+// ~315k CPM ceiling sits far inside its range, and the type stays signed to
+// match map()'s long domain and the (int)cmax/(int)cmin axis-label casts.
+int32_t cmax;
+int32_t cmin;
 
 ssd1306_t disp;
 
@@ -755,27 +763,31 @@ void drawScreen(void) {
 		tag = statusTag(60);
 		if (tag) ssd1306_draw_string(&disp, 8, 4, 1, (char *)tag);
 
-		sprintf(buf, "%lu", (unsigned long)disp_cpm);
+		snprintf(buf, sizeof(buf), "%lu", (unsigned long)disp_cpm);
 		ssd1306_draw_string(&disp, 96 - strlen(buf) * 16, 0, 2, buf);
 
-		sprintf(buf, "CPM");
+		snprintf(buf, sizeof(buf), "CPM");
 		ssd1306_draw_string(&disp, 98, 4, 1, buf);
 
-		sprintf(buf, "%.4f", (float)disp_cpm / gms);
+		snprintf(buf, sizeof(buf), "%.4f", (float)disp_cpm / gms);
 		if (strlen(buf) > 6) {
-			sprintf(buf, "%.3f", (float)disp_cpm / gms);
+			snprintf(buf, sizeof(buf), "%.3f", (float)disp_cpm / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 18, 2, buf);
 
-		sprintf(buf, "uSv");
+		snprintf(buf, sizeof(buf), "uSv");
 		ssd1306_draw_string(&disp, 98, 16, 1, buf);
 
-		sprintf(buf, "/h");
+		snprintf(buf, sizeof(buf), "/h");
 		ssd1306_draw_string(&disp, 102, 24, 1, buf);
 
 		cmax = 0;
 		for (i = 0; i < 96; i++) {
-			if (gpq[i] > cmax) cmax = gpq[i];
+			// cmax is non-negative here and gpq is uint32_t, so the cast is a
+			// plain value compare -- it only silences -Wsign-compare, which
+			// the widened types would otherwise raise. Physical CPM stays far
+			// below INT32_MAX, so the store back into cmax cannot overflow.
+			if (gpq[i] > (uint32_t)cmax) cmax = (int32_t)gpq[i];
 		}
 		cmax = cmax + 8;
 		cmax = ((cmax / 10) + 1) * 10;
@@ -810,10 +822,10 @@ void drawScreen(void) {
 		ssd1306_draw_line(&disp, 98, 35, 102, 35);
 		ssd1306_draw_line(&disp, 98, 63, 102, 63);
 
-		sprintf(buf, "%d", (int)cmax);
+		snprintf(buf, sizeof(buf), "%d", (int)cmax);
 		ssd1306_draw_string(&disp, 104, 36, 1, buf);
 
-		sprintf(buf, "%d", (int)cmin);
+		snprintf(buf, sizeof(buf), "%d", (int)cmin);
 		ssd1306_draw_string(&disp, 104, 56, 1, buf);
 
 		ssd1306_show(&disp);
@@ -827,24 +839,33 @@ void drawScreen(void) {
 		tag = statusTag(300 + 60);
 		if (tag) ssd1306_draw_string(&disp, 8, 4, 1, (char *)tag);
 
-		sprintf(buf, "%.2f", avrg);
-		ssd1306_draw_string(&disp, 96 - 24, 7, 1, buf + strlen(buf) - 3);
-		buf[strlen(buf) - 3] = 0;
+		snprintf(buf, sizeof(buf), "%.2f", avrg);
+		// Split "%.2f" into a small fractional tail (".dd") and the large
+		// integer head. "%.2f" is at least "0.00" (4 chars) for every finite
+		// avrg, so len-3 is normally in-bounds; guard len >= 3 anyway so a
+		// non-finite avrg ("inf"/"nan", 3 chars) or shorter cannot drive the
+		// pointer before buf. strlen returns size_t, so the underflow would be
+		// a huge value, not a small negative one.
+		size_t alen = strlen(buf);
+		if (alen >= 3) {
+			ssd1306_draw_string(&disp, 96 - 24, 7, 1, buf + alen - 3);
+			buf[alen - 3] = 0;
+		}
 		ssd1306_draw_string(&disp, 96 - strlen(buf) * 16 - 24 + 4, 0, 2, buf);
 
-		sprintf(buf, "CPM");
+		snprintf(buf, sizeof(buf), "CPM");
 		ssd1306_draw_string(&disp, 98, 4, 1, buf);
 
-		sprintf(buf, "%.4f", avrg / gms);
+		snprintf(buf, sizeof(buf), "%.4f", avrg / gms);
 		if (strlen(buf) > 6) {
-			sprintf(buf, "%.3f", avrg / gms);
+			snprintf(buf, sizeof(buf), "%.3f", avrg / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 18, 2, buf);
 
-		sprintf(buf, "uSv");
+		snprintf(buf, sizeof(buf), "uSv");
 		ssd1306_draw_string(&disp, 98, 16, 1, buf);
 
-		sprintf(buf, "/h");
+		snprintf(buf, sizeof(buf), "/h");
 		ssd1306_draw_string(&disp, 102, 24, 1, buf);
 
 		int k;
@@ -860,23 +881,23 @@ void drawScreen(void) {
 		}
 
 		if (uptime < 300 + 60) {
-			sprintf(buf, "MAX: UD");
+			snprintf(buf, sizeof(buf), "MAX: UD");
 		} else {
-			sprintf(buf, "MAX:%.4f", max_avrg / gms);
+			snprintf(buf, sizeof(buf), "MAX:%.4f", max_avrg / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 44, 1, buf);
 
 		if (uptime < 300 + 60) {
-			sprintf(buf, "MIN: UD");
+			snprintf(buf, sizeof(buf), "MIN: UD");
 		} else {
-			sprintf(buf, "MIN:%.4f", min_avrg / gms);
+			snprintf(buf, sizeof(buf), "MIN:%.4f", min_avrg / gms);
 		}
 		ssd1306_draw_string(&disp, 0, 56, 1, buf);
 
-		sprintf(buf, "N=");
+		snprintf(buf, sizeof(buf), "N=");
 		ssd1306_draw_string(&disp, 98, 44, 1, buf);
 
-		sprintf(buf, "300");
+		snprintf(buf, sizeof(buf), "300");
 		ssd1306_draw_string(&disp, 98, 56, 1, buf);
 
 		ssd1306_show(&disp);
@@ -884,26 +905,30 @@ void drawScreen(void) {
 	if (dispMode == 2) {
 		ssd1306_clear(&disp);
 
-		sprintf(buf, "FWV:%s", FW_VERSION);
+		// FW_VERSION is "FWNX1E-" + FW_BUILD_ID; the build id is whatever the
+		// build passes, so a full 40-char SHA would overrun buf[24] under plain
+		// sprintf and corrupt the stack. snprintf truncates instead: a bad
+		// build argument yields an ugly splash line, never memory corruption.
+		snprintf(buf, sizeof(buf), "FWV:%s", FW_VERSION);
 		ssd1306_draw_string(&disp, 0, 0, 1, buf);
 
-		sprintf(buf, "TCN:%lu", total_cnt);
+		snprintf(buf, sizeof(buf), "TCN:%lu", total_cnt);
 		ssd1306_draw_string(&disp, 0, 9, 1, buf);
 
-		sprintf(buf, "CH1:%lu", ch1_cnt);
+		snprintf(buf, sizeof(buf), "CH1:%lu", ch1_cnt);
 		ssd1306_draw_string(&disp, 0, 18, 1, buf);
 
-		sprintf(buf, "CH2:%lu", ch2_cnt);
+		snprintf(buf, sizeof(buf), "CH2:%lu", ch2_cnt);
 		ssd1306_draw_string(&disp, 0, 27, 1, buf);
 
-		sprintf(buf, "OTS:%lu", uptime);
+		snprintf(buf, sizeof(buf), "OTS:%lu", uptime);
 		ssd1306_draw_string(&disp, 0, 36, 1, buf);
 
 		// Read immediately before formatting. The old button-driven path
 		// printed a stale global here.
 		result = adc_read();
 
-		sprintf(buf, "VCC:%f", result * conversion_factor);
+		snprintf(buf, sizeof(buf), "VCC:%f", result * conversion_factor);
 		ssd1306_draw_string(&disp, 0, 45, 1, buf);
 
 		ssd1306_show(&disp);
